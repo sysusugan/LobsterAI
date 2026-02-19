@@ -174,9 +174,15 @@ const coworkSlice = createSlice({
       const { sessionId, messageId, content } = action.payload;
 
       if (state.currentSession?.id === sessionId) {
-        const messageIndex = state.currentSession.messages.findIndex(m => m.id === messageId);
-        if (messageIndex !== -1) {
-          state.currentSession.messages[messageIndex].content = content;
+        const messages = state.currentSession.messages;
+        for (let i = messages.length - 1; i >= 0; i -= 1) {
+          if (messages[i].id !== messageId) {
+            continue;
+          }
+          if (messages[i].content !== content) {
+            messages[i].content = content;
+          }
+          break;
         }
       }
 
