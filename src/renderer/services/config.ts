@@ -66,6 +66,14 @@ const normalizeProvidersConfig = (providers: AppConfig['providers']): AppConfig[
   ) as AppConfig['providers'];
 };
 
+const isConfigEqual = (left: AppConfig, right: AppConfig): boolean => {
+  try {
+    return JSON.stringify(left) === JSON.stringify(right);
+  } catch {
+    return false;
+  }
+};
+
 class ConfigService {
   private config: AppConfig = defaultConfig;
 
@@ -128,11 +136,15 @@ class ConfigService {
 
   async updateConfig(newConfig: Partial<AppConfig>) {
     const normalizedProviders = normalizeProvidersConfig(newConfig.providers as AppConfig['providers'] | undefined);
-    this.config = {
+    const nextConfig: AppConfig = {
       ...this.config,
       ...newConfig,
       ...(normalizedProviders ? { providers: normalizedProviders } : {}),
     };
+    if (isConfigEqual(nextConfig, this.config)) {
+      return;
+    }
+    this.config = nextConfig;
     await localStore.setItem(CONFIG_KEYS.APP_CONFIG, this.config);
   }
 

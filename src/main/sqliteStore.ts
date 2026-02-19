@@ -13,6 +13,7 @@ type ChangePayload<T = unknown> = {
 };
 
 const USER_MEMORIES_MIGRATION_KEY = 'userMemories.migration.v1.completed';
+const SAVE_DEBOUNCE_MS = 120;
 
 // Get the path to sql.js WASM file
 function getWasmPath(): string {
@@ -32,6 +33,10 @@ export class SqliteStore {
   private dbPath: string;
   private emitter = new EventEmitter();
   private static sqlPromise: Promise<SqlJsStatic> | null = null;
+  private saveTimer: NodeJS.Timeout | null = null;
+  private saveInFlight = false;
+  private saveQueued = false;
+  private flushResolvers: Array<() => void> = [];
 
   private constructor(db: Database, dbPath: string) {
     this.db = db;
@@ -300,9 +305,77 @@ export class SqliteStore {
   }
 
   save() {
-    const data = this.db.export();
-    const buffer = Buffer.from(data);
-    fs.writeFileSync(this.dbPath, buffer);
+    this.saveQueued = true;
+    if (this.saveInFlight) {
+      return;
+    }
+    this.scheduleSave();
+  }
+
+  async flushPendingSave(): Promise<void> {
+    if (this.saveTimer) {
+      clearTimeout(this.saveTimer);
+      this.saveTimer = null;
+    }
+
+    if (!this.saveQueued && !this.saveInFlight) {
+      return;
+    }
+
+    const done = new Promise<void>((resolve) => {
+      this.flushResolvers.push(resolve);
+    });
+
+    if (!this.saveInFlight) {
+      void this.persistQueuedChanges();
+    }
+
+    await done;
+  }
+
+  private scheduleSave(): void {
+    if (this.saveTimer) {
+      return;
+    }
+    this.saveTimer = setTimeout(() => {
+      this.saveTimer = null;
+      void this.persistQueuedChanges();
+    }, SAVE_DEBOUNCE_MS);
+  }
+
+  private async persistQueuedChanges(): Promise<void> {
+    if (this.saveInFlight) {
+      return;
+    }
+
+    this.saveInFlight = true;
+    try {
+      while (this.saveQueued) {
+        this.saveQueued = false;
+        const data = this.db.export();
+        const buffer = Buffer.from(data);
+        await fs.promises.writeFile(this.dbPath, buffer);
+      }
+    } catch (error) {
+      console.error('Failed to persist sqlite store:', error);
+    } finally {
+      this.saveInFlight = false;
+      if (this.saveQueued && !this.saveTimer) {
+        this.scheduleSave();
+      }
+      this.resolveFlushResolversIfIdle();
+    }
+  }
+
+  private resolveFlushResolversIfIdle(): void {
+    if (this.saveTimer || this.saveInFlight || this.saveQueued) {
+      return;
+    }
+    if (this.flushResolvers.length === 0) {
+      return;
+    }
+    const resolvers = this.flushResolvers.splice(0, this.flushResolvers.length);
+    resolvers.forEach((resolve) => resolve());
   }
 
   onDidChange<T = unknown>(key: string, callback: (newValue: T | undefined, oldValue: T | undefined) => void) {

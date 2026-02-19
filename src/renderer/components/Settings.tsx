@@ -280,6 +280,14 @@ const getDefaultActiveProvider = (): ProviderType => {
   return firstEnabledProvider ?? providerKeys[0];
 };
 
+const serializeImConfig = (value: unknown): string => {
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return '';
+  }
+};
+
 const Settings: React.FC<SettingsProps> = ({ onClose, initialTab, notice }) => {
   const dispatch = useDispatch();
   // 状态
@@ -327,6 +335,7 @@ const Settings: React.FC<SettingsProps> = ({ onClose, initialTab, notice }) => {
 
   const coworkConfig = useSelector((state: RootState) => state.cowork.config);
   const imConfig = useSelector((state: RootState) => state.im.config);
+  const initialImConfigRef = useRef<string>(serializeImConfig(imConfig));
 
   const [coworkExecutionMode, setCoworkExecutionMode] = useState<CoworkExecutionMode>(coworkConfig.executionMode || 'local');
   const [coworkMemoryEnabled, setCoworkMemoryEnabled] = useState<boolean>(coworkConfig.memoryEnabled ?? true);
@@ -903,8 +912,11 @@ const Settings: React.FC<SettingsProps> = ({ onClose, initialTab, notice }) => {
         });
       }
 
-      // Save IM config
-      await imService.updateConfig(imConfig);
+      const hasImConfigChanges = serializeImConfig(imConfig) !== initialImConfigRef.current;
+      if (hasImConfigChanges) {
+        await imService.updateConfig(imConfig);
+      }
+      initialImConfigRef.current = serializeImConfig(imConfig);
 
       didSaveRef.current = true;
       onClose();

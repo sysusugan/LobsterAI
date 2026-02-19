@@ -121,7 +121,7 @@ export class IMStore {
     }
   }
 
-  private setConfigValue<T>(key: string, value: T): void {
+  private setConfigValue<T>(key: string, value: T, options?: { skipSave?: boolean }): void {
     const now = Date.now();
     this.db.run(`
       INSERT INTO im_config (key, value, updated_at)
@@ -130,7 +130,9 @@ export class IMStore {
         value = excluded.value,
         updated_at = excluded.updated_at
     `, [key, JSON.stringify(value), now]);
-    this.saveDb();
+    if (!options?.skipSave) {
+      this.saveDb();
+    }
   }
 
   // ==================== Full Config Operations ====================
@@ -163,20 +165,31 @@ export class IMStore {
   }
 
   setConfig(config: Partial<IMGatewayConfig>): void {
+    let changed = false;
+
     if (config.dingtalk) {
-      this.setDingTalkConfig(config.dingtalk);
+      this.setDingTalkConfig(config.dingtalk, { skipSave: true });
+      changed = true;
     }
     if (config.feishu) {
-      this.setFeishuConfig(config.feishu);
+      this.setFeishuConfig(config.feishu, { skipSave: true });
+      changed = true;
     }
     if (config.telegram) {
-      this.setTelegramConfig(config.telegram);
+      this.setTelegramConfig(config.telegram, { skipSave: true });
+      changed = true;
     }
     if (config.discord) {
-      this.setDiscordConfig(config.discord);
+      this.setDiscordConfig(config.discord, { skipSave: true });
+      changed = true;
     }
     if (config.settings) {
-      this.setIMSettings(config.settings);
+      this.setIMSettings(config.settings, { skipSave: true });
+      changed = true;
+    }
+
+    if (changed) {
+      this.saveDb();
     }
   }
 
@@ -187,9 +200,9 @@ export class IMStore {
     return { ...DEFAULT_DINGTALK_CONFIG, ...stored };
   }
 
-  setDingTalkConfig(config: Partial<DingTalkConfig>): void {
+  setDingTalkConfig(config: Partial<DingTalkConfig>, options?: { skipSave?: boolean }): void {
     const current = this.getDingTalkConfig();
-    this.setConfigValue('dingtalk', { ...current, ...config });
+    this.setConfigValue('dingtalk', { ...current, ...config }, options);
   }
 
   // ==================== Feishu Config ====================
@@ -199,9 +212,9 @@ export class IMStore {
     return { ...DEFAULT_FEISHU_CONFIG, ...stored };
   }
 
-  setFeishuConfig(config: Partial<FeishuConfig>): void {
+  setFeishuConfig(config: Partial<FeishuConfig>, options?: { skipSave?: boolean }): void {
     const current = this.getFeishuConfig();
-    this.setConfigValue('feishu', { ...current, ...config });
+    this.setConfigValue('feishu', { ...current, ...config }, options);
   }
 
   // ==================== Telegram Config ====================
@@ -211,9 +224,9 @@ export class IMStore {
     return { ...DEFAULT_TELEGRAM_CONFIG, ...stored };
   }
 
-  setTelegramConfig(config: Partial<TelegramConfig>): void {
+  setTelegramConfig(config: Partial<TelegramConfig>, options?: { skipSave?: boolean }): void {
     const current = this.getTelegramConfig();
-    this.setConfigValue('telegram', { ...current, ...config });
+    this.setConfigValue('telegram', { ...current, ...config }, options);
   }
 
   // ==================== Discord Config ====================
@@ -223,9 +236,9 @@ export class IMStore {
     return { ...DEFAULT_DISCORD_CONFIG, ...stored };
   }
 
-  setDiscordConfig(config: Partial<DiscordConfig>): void {
+  setDiscordConfig(config: Partial<DiscordConfig>, options?: { skipSave?: boolean }): void {
     const current = this.getDiscordConfig();
-    this.setConfigValue('discord', { ...current, ...config });
+    this.setConfigValue('discord', { ...current, ...config }, options);
   }
 
   // ==================== IM Settings ====================
@@ -235,9 +248,9 @@ export class IMStore {
     return { ...DEFAULT_IM_SETTINGS, ...stored };
   }
 
-  setIMSettings(settings: Partial<IMSettings>): void {
+  setIMSettings(settings: Partial<IMSettings>, options?: { skipSave?: boolean }): void {
     const current = this.getIMSettings();
-    this.setConfigValue('settings', { ...current, ...settings });
+    this.setConfigValue('settings', { ...current, ...settings }, options);
   }
 
   // ==================== Utility ====================

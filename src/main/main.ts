@@ -2196,6 +2196,8 @@ if (!gotTheLock) {
     if (scheduler) {
       scheduler.stop();
     }
+
+    await store?.flushPendingSave?.();
   };
 
   app.on('before-quit', (e) => {
@@ -2270,10 +2272,6 @@ if (!gotTheLock) {
     manager.syncBundledSkillsToUserData();
     manager.startWatching();
 
-    // Start skill services
-    const skillServices = getSkillServiceManager();
-    await skillServices.startAll();
-
     // [关键代码] 显式告诉 Electron 使用系统的代理配置
     // 这会涵盖绝大多数 VPN（如 Clash, V2Ray 等开启了"系统代理"模式的情况）
     await session.defaultSession.setProxy({ mode: 'system' });
@@ -2291,6 +2289,12 @@ if (!gotTheLock) {
 
     // 创建窗口
     createWindow();
+
+    // Start skill services in background to avoid blocking first interaction.
+    const skillServices = getSkillServiceManager();
+    void skillServices.startAll().catch((error) => {
+      console.error('[SkillServices] Failed to start in background:', error);
+    });
 
     // Auto-reconnect IM bots that were enabled before restart
     getIMGatewayManager().startAllEnabled().catch((error) => {
