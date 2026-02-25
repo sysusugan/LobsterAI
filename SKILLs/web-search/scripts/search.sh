@@ -7,6 +7,16 @@ DEFAULT_SERVER_URL="http://127.0.0.1:8923"
 SERVER_URL="${WEB_SEARCH_SERVER:-$DEFAULT_SERVER_URL}"
 ACTIVE_SERVER_URL="$SERVER_URL"
 CONNECTION_CACHE="$PROJECT_DIR/.connection"
+HTTP_TIMEOUT_SEC="${WEB_SEARCH_HTTP_TIMEOUT_SEC:-35}"
+HTTP_CONNECT_TIMEOUT_SEC="${WEB_SEARCH_HTTP_CONNECT_TIMEOUT_SEC:-8}"
+
+case "$HTTP_TIMEOUT_SEC" in
+  ''|*[!0-9]*) HTTP_TIMEOUT_SEC=35 ;;
+esac
+
+case "$HTTP_CONNECT_TIMEOUT_SEC" in
+  ''|*[!0-9]*) HTTP_CONNECT_TIMEOUT_SEC=8 ;;
+esac
 
 # Colors for output
 RED='\033[0;31m'
@@ -42,6 +52,8 @@ Examples:
 Environment:
   WEB_SEARCH_SERVER   Bridge Server URL (default: http://127.0.0.1:8923)
   WEB_SEARCH_ENGINE   Preferred engine: auto|google|bing (default: auto)
+  WEB_SEARCH_HTTP_TIMEOUT_SEC   HTTP request timeout in seconds (default: 35)
+  WEB_SEARCH_HTTP_CONNECT_TIMEOUT_SEC   HTTP connect timeout in seconds (default: 8)
 
 EOF
   exit 1
@@ -79,11 +91,16 @@ http_request() {
   if ! is_windows_bash; then
     if command -v curl > /dev/null 2>&1; then
       if [ "$METHOD" = "GET" ]; then
-        if curl -s -f "$URL" 2>/dev/null; then
+        if curl -s -f \
+          --connect-timeout "$HTTP_CONNECT_TIMEOUT_SEC" \
+          --max-time "$HTTP_TIMEOUT_SEC" \
+          "$URL" 2>/dev/null; then
           return 0
         fi
       else
         if curl -s -f -X "$METHOD" "$URL" \
+          --connect-timeout "$HTTP_CONNECT_TIMEOUT_SEC" \
+          --max-time "$HTTP_TIMEOUT_SEC" \
           -H "Content-Type: application/json" \
           -d "$BODY" 2>/dev/null; then
           return 0
@@ -93,11 +110,12 @@ http_request() {
 
     if command -v wget > /dev/null 2>&1; then
       if [ "$METHOD" = "GET" ]; then
-        if wget -q -O- "$URL" 2>/dev/null; then
+        if wget -q -O- --timeout="$HTTP_TIMEOUT_SEC" "$URL" 2>/dev/null; then
           return 0
         fi
       else
         if wget -q -O- --method="$METHOD" \
+          --timeout="$HTTP_TIMEOUT_SEC" \
           --header="Content-Type: application/json" \
           --body-data="$BODY" \
           "$URL" 2>/dev/null; then
@@ -111,12 +129,15 @@ http_request() {
     return 127
   fi
 
-  env "${HTTP_NODE_ENV_PREFIX[@]}" "$HTTP_NODE_CMD" "${HTTP_NODE_ARGS[@]}" - "$METHOD" "$URL" "$BODY" <<'NODE'
-const [method, url, body] = process.argv.slice(2);
+  env "${HTTP_NODE_ENV_PREFIX[@]}" "$HTTP_NODE_CMD" "${HTTP_NODE_ARGS[@]}" - "$METHOD" "$URL" "$BODY" "$HTTP_TIMEOUT_SEC" <<'NODE'
+const [method, url, body, timeoutSecRaw] = process.argv.slice(2);
+const timeoutSec = Number.parseInt(timeoutSecRaw, 10);
+const timeoutMs = Number.isFinite(timeoutSec) && timeoutSec > 0 ? timeoutSec * 1000 : 35000;
 
 (async () => {
   try {
     const init = { method };
+    init.signal = AbortSignal.timeout(timeoutMs);
     if (method !== 'GET') {
       init.headers = { 'Content-Type': 'application/json' };
       init.body = body ?? '';
