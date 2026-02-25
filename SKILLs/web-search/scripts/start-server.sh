@@ -11,6 +11,16 @@ SERVER_PORT="8923"
 DEFAULT_SERVER_URL="http://127.0.0.1:8923"
 SERVER_URL="${WEB_SEARCH_SERVER:-$DEFAULT_SERVER_URL}"
 HEALTHY_SERVER_URL=""
+HTTP_TIMEOUT_SEC="${WEB_SEARCH_HTTP_TIMEOUT_SEC:-8}"
+HTTP_CONNECT_TIMEOUT_SEC="${WEB_SEARCH_HTTP_CONNECT_TIMEOUT_SEC:-3}"
+
+case "$HTTP_TIMEOUT_SEC" in
+  ''|*[!0-9]*) HTTP_TIMEOUT_SEC=8 ;;
+esac
+
+case "$HTTP_CONNECT_TIMEOUT_SEC" in
+  ''|*[!0-9]*) HTTP_CONNECT_TIMEOUT_SEC=3 ;;
+esac
 
 NODE_CMD=""
 NODE_ARGS=()
@@ -38,13 +48,16 @@ http_get() {
   local URL="$1"
 
   if command -v curl > /dev/null 2>&1; then
-    if curl -s -f "$URL" 2>/dev/null; then
+    if curl -s -f \
+      --connect-timeout "$HTTP_CONNECT_TIMEOUT_SEC" \
+      --max-time "$HTTP_TIMEOUT_SEC" \
+      "$URL" 2>/dev/null; then
       return 0
     fi
   fi
 
   if command -v wget > /dev/null 2>&1; then
-    if wget -q -O- "$URL" 2>/dev/null; then
+    if wget -q -O- --timeout="$HTTP_TIMEOUT_SEC" "$URL" 2>/dev/null; then
       return 0
     fi
   fi
@@ -53,12 +66,14 @@ http_get() {
     return 127
   fi
 
-  env "${NODE_ENV_PREFIX[@]}" "$NODE_CMD" "${NODE_ARGS[@]}" - "$URL" <<'NODE'
-const [url] = process.argv.slice(2);
+  env "${NODE_ENV_PREFIX[@]}" "$NODE_CMD" "${NODE_ARGS[@]}" - "$URL" "$HTTP_TIMEOUT_SEC" <<'NODE'
+const [url, timeoutSecRaw] = process.argv.slice(2);
+const timeoutSec = Number.parseInt(timeoutSecRaw, 10);
+const timeoutMs = Number.isFinite(timeoutSec) && timeoutSec > 0 ? timeoutSec * 1000 : 8000;
 
 (async () => {
   try {
-    const response = await fetch(url);
+    const response = await fetch(url, { signal: AbortSignal.timeout(timeoutMs) });
     if (!response.ok) {
       process.exit(22);
     }

@@ -657,6 +657,12 @@ const isWebSearchSkillBroken = (skillRoot: string): boolean => {
     if (!startScript.includes('detect_healthy_bridge_server')) {
       return true;
     }
+    if (!startScript.includes('WEB_SEARCH_HTTP_TIMEOUT_SEC')) {
+      return true;
+    }
+    if (!startScript.includes('--max-time "$HTTP_TIMEOUT_SEC"')) {
+      return true;
+    }
     if (!searchScriptContent.includes('ACTIVE_SERVER_URL')) {
       return true;
     }
@@ -667,6 +673,12 @@ const isWebSearchSkillBroken = (skillRoot: string): boolean => {
       return true;
     }
     if (!searchScriptContent.includes('@query_file')) {
+      return true;
+    }
+    if (!searchScriptContent.includes('WEB_SEARCH_HTTP_TIMEOUT_SEC')) {
+      return true;
+    }
+    if (!searchScriptContent.includes('--max-time "$HTTP_TIMEOUT_SEC"')) {
       return true;
     }
     if (!serverEntryContent.includes('decodeJsonRequestBody')) {
@@ -701,10 +713,6 @@ export class SkillManager {
   }
 
   syncBundledSkillsToUserData(): void {
-    if (!app.isPackaged) {
-      return;
-    }
-
     const userRoot = this.ensureSkillsRoot();
     const bundledRoot = this.getBundledSkillsRoot();
     if (!bundledRoot || bundledRoot === userRoot || !fs.existsSync(bundledRoot)) {
