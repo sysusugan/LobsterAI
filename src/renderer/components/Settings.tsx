@@ -93,6 +93,7 @@ type ProviderConnectionTestResult = {
   provider: ProviderType;
   success: boolean;
   message: string;
+  title?: string;
 };
 
 interface ProviderExportEntry {
@@ -1055,6 +1056,7 @@ const Settings: React.FC<SettingsProps> = ({ onClose, initialTab, notice }) => {
   const isAntigravityConnected = Boolean(oauthStatusByProvider.antigravity?.connected);
 
   const handleAntigravityOAuthLogin = async () => {
+    setNoticeMessage(null);
     setError(null);
     updateOAuthProviderAction('antigravity', 'login');
     try {
@@ -1063,15 +1065,24 @@ const Settings: React.FC<SettingsProps> = ({ onClose, initialTab, notice }) => {
         throw new Error(response.error || i18nService.t('oauthLoginFailed'));
       }
       applyAntigravityOAuthState(response.status);
-      setNoticeMessage(i18nService.t('oauthLoginSuccess'));
+      showTestResultModal({
+        success: true,
+        message: i18nService.t('oauthLoginSuccess'),
+        title: i18nService.t('operationResult'),
+      }, 'antigravity');
     } catch (oauthError) {
-      setError(oauthError instanceof Error ? oauthError.message : i18nService.t('oauthLoginFailed'));
+      showTestResultModal({
+        success: false,
+        message: oauthError instanceof Error ? oauthError.message : i18nService.t('oauthLoginFailed'),
+        title: i18nService.t('operationResult'),
+      }, 'antigravity');
     } finally {
       updateOAuthProviderAction('antigravity');
     }
   };
 
   const handleAntigravityOAuthDisconnect = async () => {
+    setNoticeMessage(null);
     setError(null);
     updateOAuthProviderAction('antigravity', 'disconnect');
     try {
@@ -1080,15 +1091,24 @@ const Settings: React.FC<SettingsProps> = ({ onClose, initialTab, notice }) => {
         throw new Error(response.error || i18nService.t('oauthDisconnectFailed'));
       }
       applyAntigravityOAuthState(response.status);
-      setNoticeMessage(i18nService.t('oauthDisconnectSuccess'));
+      showTestResultModal({
+        success: true,
+        message: i18nService.t('oauthDisconnectSuccess'),
+        title: i18nService.t('operationResult'),
+      }, 'antigravity');
     } catch (oauthError) {
-      setError(oauthError instanceof Error ? oauthError.message : i18nService.t('oauthDisconnectFailed'));
+      showTestResultModal({
+        success: false,
+        message: oauthError instanceof Error ? oauthError.message : i18nService.t('oauthDisconnectFailed'),
+        title: i18nService.t('operationResult'),
+      }, 'antigravity');
     } finally {
       updateOAuthProviderAction('antigravity');
     }
   };
 
   const handleAntigravitySyncModels = async () => {
+    setNoticeMessage(null);
     setError(null);
     updateOAuthProviderAction('antigravity', 'sync');
     try {
@@ -1120,20 +1140,39 @@ const Settings: React.FC<SettingsProps> = ({ onClose, initialTab, notice }) => {
       }
 
       if (syncResult.source === 'remote') {
-        setNoticeMessage(i18nService.t('oauthSyncModelsSuccess'));
+        showTestResultModal({
+          success: true,
+          message: i18nService.t('oauthSyncModelsSuccess'),
+          title: i18nService.t('operationResult'),
+        }, 'antigravity');
       } else {
-        setNoticeMessage(i18nService.t('oauthSyncModelsFallback'));
+        const fallbackMessage = i18nService.t('oauthSyncModelsFallback');
         if (syncResult.warning) {
-          setError(extractConnectionErrorMessage(
+          const warningMessage = extractConnectionErrorMessage(
             { error: { message: syncResult.warning } },
             403,
             'antigravity',
             latestStatus?.projectId || oauthStatusByProvider.antigravity?.projectId
-          ));
+          );
+          showTestResultModal({
+            success: false,
+            message: `${fallbackMessage}\n${warningMessage}`,
+            title: i18nService.t('operationResult'),
+          }, 'antigravity');
+        } else {
+          showTestResultModal({
+            success: true,
+            message: fallbackMessage,
+            title: i18nService.t('operationResult'),
+          }, 'antigravity');
         }
       }
     } catch (oauthError) {
-      setError(oauthError instanceof Error ? oauthError.message : i18nService.t('oauthSyncModelsFailed'));
+      showTestResultModal({
+        success: false,
+        message: oauthError instanceof Error ? oauthError.message : i18nService.t('oauthSyncModelsFailed'),
+        title: i18nService.t('operationResult'),
+      }, 'antigravity');
     } finally {
       updateOAuthProviderAction('antigravity');
     }
@@ -3104,7 +3143,7 @@ const Settings: React.FC<SettingsProps> = ({ onClose, initialTab, notice }) => {
               >
                 <div className="flex items-center justify-between mb-3">
                   <h4 className="text-sm font-semibold dark:text-claude-darkText text-claude-text">
-                    {i18nService.t('connectionTestResult')}
+                    {testResult.title ?? i18nService.t('connectionTestResult')}
                   </h4>
                   <button
                     type="button"
