@@ -29,6 +29,9 @@ export const startMockOpenAIUpstream = async (options = {}) => {
   const cloudCodeParts = Array.isArray(options.cloudCodeParts) && options.cloudCodeParts.length > 0
     ? options.cloudCodeParts
     : null;
+  const rejectThinkingLevel = options.rejectThinkingLevel === true;
+  const thinkingLevelErrorMessage = normalizeString(options.thinkingLevelErrorMessage)
+    || 'Unable to submit request because thinking_level is not supported by this model.';
 
   const requests = [];
 
@@ -99,6 +102,19 @@ export const startMockOpenAIUpstream = async (options = {}) => {
     const requestNo = requests.length;
 
     if (isCloudCodePath) {
+      if (rejectThinkingLevel) {
+        const thinkingLevel = body?.request?.generationConfig?.thinkingConfig?.thinkingLevel;
+        if (typeof thinkingLevel === 'string' && thinkingLevel.trim()) {
+          writeJson(res, 400, {
+            error: {
+              type: 'api_error',
+              message: thinkingLevelErrorMessage,
+            },
+          });
+          return;
+        }
+      }
+
       res.writeHead(200, {
         'Content-Type': 'text/event-stream',
         'Cache-Control': 'no-cache',

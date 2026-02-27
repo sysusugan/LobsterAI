@@ -49,6 +49,7 @@ TESTCASES=(
   "scripts/testcases/testcase_01_oauth_profile.mjs"
   "scripts/testcases/testcase_02_fetch_models.mjs"
   "scripts/testcases/testcase_03_chat_gemini3.mjs"
+  "scripts/testcases/testcase_08_cloudcode_model_matrix.mjs"
 )
 
 FAILED=0

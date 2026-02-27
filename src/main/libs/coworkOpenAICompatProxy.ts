@@ -64,6 +64,7 @@ const LOCAL_HOST = '127.0.0.1';
 const DEFAULT_PI_MODEL_MAX_TOKENS = 65536;
 const DEFAULT_PI_MODEL_CONTEXT_WINDOW = 1048576;
 const DEFAULT_ANTIGRAVITY_REQUEST_TIMEOUT_MS = 120000;
+const DEFAULT_CLOUDCODE_STREAM_IDLE_TIMEOUT_MS = 15000;
 const BASE64_THOUGHT_SIGNATURE_RE = /^[A-Za-z0-9+/]+={0,2}$/;
 const CLOUD_CODE_PROD_ENDPOINT = 'https://cloudcode-pa.googleapis.com';
 const CLOUD_CODE_DAILY_ENDPOINT = 'https://daily-cloudcode-pa.sandbox.googleapis.com';
@@ -1616,6 +1617,67 @@ function convertPiContextMessagesToCloudCodeContents(
   return contents;
 }
 
+type CloudCodeThinkingLevel = 'LOW' | 'MEDIUM' | 'HIGH';
+
+function resolveCloudCodeThinkingLevel(modelId: string): CloudCodeThinkingLevel | null {
+  const normalized = modelId.toLowerCase();
+  if (normalized.includes('pro-high')) {
+    return 'HIGH';
+  }
+  if (normalized.includes('pro-low')) {
+    return 'LOW';
+  }
+  if (normalized.includes('flash')) {
+    return 'LOW';
+  }
+  if (normalized.includes('thinking')) {
+    return 'MEDIUM';
+  }
+  return null;
+}
+
+function buildCloudCodeThinkingConfig(modelId: string): Record<string, unknown> | null {
+  const normalized = modelId.toLowerCase();
+  if (!normalized.startsWith('gemini-')) {
+    return null;
+  }
+
+  const thinkingConfig: Record<string, unknown> = {
+    includeThoughts: true,
+  };
+  const thinkingLevel = resolveCloudCodeThinkingLevel(normalized);
+  if (thinkingLevel) {
+    thinkingConfig.thinkingLevel = thinkingLevel;
+  }
+  return thinkingConfig;
+}
+
+function removeCloudCodeThinkingLevel(requestBody: Record<string, unknown>): boolean {
+  const requestObj = toOptionalObject(requestBody.request);
+  if (!requestObj) {
+    return false;
+  }
+
+  const generationConfig = toOptionalObject(requestObj.generationConfig);
+  if (!generationConfig) {
+    return false;
+  }
+
+  const thinkingConfig = toOptionalObject(generationConfig.thinkingConfig);
+  if (!thinkingConfig || !Object.prototype.hasOwnProperty.call(thinkingConfig, 'thinkingLevel')) {
+    return false;
+  }
+
+  delete thinkingConfig.thinkingLevel;
+  if (Object.keys(thinkingConfig).length === 0) {
+    delete generationConfig.thinkingConfig;
+  }
+  if (Object.keys(generationConfig).length === 0) {
+    delete requestObj.generationConfig;
+  }
+  return true;
+}
+
 function buildCloudCodeAssistRequestBody(
   openAIRequest: Record<string, unknown>,
   modelId: string,
@@ -1643,6 +1705,10 @@ function buildCloudCodeAssistRequestBody(
   }
   if (typeof optionsObj.temperature === 'number' && Number.isFinite(optionsObj.temperature)) {
     generationConfig.temperature = optionsObj.temperature;
+  }
+  const thinkingConfig = buildCloudCodeThinkingConfig(modelId);
+  if (thinkingConfig) {
+    generationConfig.thinkingConfig = thinkingConfig;
   }
   if (Object.keys(generationConfig).length > 0) {
     requestObj.generationConfig = generationConfig;
@@ -1743,9 +1809,47 @@ async function* streamCloudCodeSSEAsPiEvents(
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
   let buffer = '';
+  const streamIdleTimeoutMs = Number(process.env.LOBSTER_CLOUDCODE_STREAM_IDLE_TIMEOUT_MS)
+    || DEFAULT_CLOUDCODE_STREAM_IDLE_TIMEOUT_MS;
+  const READ_TIMEOUT = Symbol('cloudcode-read-timeout');
+
+  const readWithTimeout = async (): Promise<Awaited<ReturnType<typeof reader.read>> | typeof READ_TIMEOUT> => {
+    let timeoutId: ReturnType<typeof setTimeout> | null = null;
+    try {
+      return await Promise.race<Awaited<ReturnType<typeof reader.read>> | typeof READ_TIMEOUT>([
+        reader.read(),
+        new Promise<typeof READ_TIMEOUT>((resolve) => {
+          timeoutId = setTimeout(() => resolve(READ_TIMEOUT), streamIdleTimeoutMs);
+        }),
+      ]);
+    } finally {
+      if (timeoutId) {
+        clearTimeout(timeoutId);
+      }
+    }
+  };
 
   while (true) {
-    const { done, value } = await reader.read();
+    const readResult = await readWithTimeout();
+
+    if (readResult === READ_TIMEOUT) {
+      try {
+        await reader.cancel();
+      } catch {
+        // ignore
+      }
+      if (hasContent) {
+        console.warn('[cowork-openai-compat-proxy] CloudCode stream idle timeout, finalizing with partial content', {
+          modelId,
+          streamIdleTimeoutMs,
+          stopReason,
+        });
+        break;
+      }
+      throw new Error(`Cloud Code Assist stream idle timeout after ${Math.floor(streamIdleTimeoutMs / 1000)}s`);
+    }
+
+    const { done, value } = readResult;
     if (done) {
       break;
     }
@@ -2017,6 +2121,12 @@ async function handleCloudCodeAssistRequest(
 
   const requestBody = buildCloudCodeAssistRequestBody(openAIRequest, normalizedModelId, projectId);
   const targetURLs = buildCloudCodeStreamGenerateContentURLs(config.baseURL);
+  const requestTimeoutMs = Number(process.env.LOBSTER_ANTIGRAVITY_REQUEST_TIMEOUT_MS)
+    || DEFAULT_ANTIGRAVITY_REQUEST_TIMEOUT_MS;
+  const requestAbortController = new AbortController();
+  const requestAbortTimer = setTimeout(() => {
+    requestAbortController.abort(new Error(`timeout-${requestTimeoutMs}`));
+  }, requestTimeoutMs);
   const baseRequestHeaders = {
     'Content-Type': 'application/json',
     Accept: 'text/event-stream',
@@ -2038,6 +2148,7 @@ async function handleCloudCodeAssistRequest(
           : {}),
       },
       body: JSON.stringify(requestBody),
+      signal: requestAbortController.signal,
     });
   };
 
@@ -2056,6 +2167,17 @@ async function handleCloudCodeAssistRequest(
       || normalized.includes('missing required header')
       || normalized.includes('quota project');
   };
+  const shouldRetryWithoutThinkingLevel = (statusCode: number, rawErrorText: string): boolean => {
+    if (statusCode !== 400) {
+      return false;
+    }
+    const normalized = rawErrorText.toLowerCase();
+    const mentionsThinkingLevel = /thinking[\s_-]?level/i.test(rawErrorText);
+    const indicatesUnsupported = normalized.includes('not supported')
+      || normalized.includes('unsupported');
+    return mentionsThinkingLevel && indicatesUnsupported;
+  };
+  let removedThinkingLevelAndRetried = false;
 
   for (let authAttempt = 0; authAttempt < 2; authAttempt += 1) {
     for (let i = 0; i < targetURLs.length; i += 1) {
@@ -2073,6 +2195,20 @@ async function handleCloudCodeAssistRequest(
         && Boolean(toString(getCurrentProjectId()))
       ) {
         includeUserProjectHeader = true;
+        upstreamResponse = await send(currentTargetURL, includeUserProjectHeader);
+        if (upstreamResponse.ok) {
+          upstreamErrorText = '';
+          break;
+        }
+        upstreamErrorText = await upstreamResponse.text();
+      }
+
+      if (
+        !removedThinkingLevelAndRetried
+        && shouldRetryWithoutThinkingLevel(upstreamResponse.status, upstreamErrorText)
+        && removeCloudCodeThinkingLevel(requestBody)
+      ) {
+        removedThinkingLevelAndRetried = true;
         upstreamResponse = await send(currentTargetURL, includeUserProjectHeader);
         if (upstreamResponse.ok) {
           upstreamErrorText = '';
@@ -2109,36 +2245,40 @@ async function handleCloudCodeAssistRequest(
     break;
   }
 
-  if (!upstreamResponse || !upstreamResponse.ok) {
-    const statusCode = upstreamResponse?.status ?? 502;
-    const errorText = upstreamErrorText || (upstreamResponse ? await upstreamResponse.text() : '');
-    const errorMessage = extractErrorMessage(errorText) || `Cloud Code Assist API error (${statusCode})`;
-    throw new Error(`Cloud Code Assist API error (${statusCode}): ${errorMessage} [${currentTargetURL}]`);
-  }
-
-  const piEvents = streamCloudCodeSSEAsPiEvents(upstreamResponse, normalizedModelId);
-  if (stream) {
-    try {
-      const relay = await relayPiAiStreamAsAnthropicSSE(piEvents, res, normalizedModelId);
-      if (!relay.started && relay.errorMessage) {
-        throw new Error(relay.errorMessage);
-      }
-    } catch (error) {
-      const message = error instanceof Error ? error.message : 'Cloud Code Assist stream failed';
-      if (res.headersSent) {
-        emitSSE(res, 'error', createAnthropicErrorBody(message));
-        res.end();
-        return;
-      }
-      throw error;
+  try {
+    if (!upstreamResponse || !upstreamResponse.ok) {
+      const statusCode = upstreamResponse?.status ?? 502;
+      const errorText = upstreamErrorText || (upstreamResponse ? await upstreamResponse.text() : '');
+      const errorMessage = extractErrorMessage(errorText) || `Cloud Code Assist API error (${statusCode})`;
+      throw new Error(`Cloud Code Assist API error (${statusCode}): ${errorMessage} [${currentTargetURL}]`);
     }
-    return;
-  }
 
-  const finalMessage = await collectPiAiFinalMessage(piEvents);
-  const openAIResponse = buildOpenAIResponseFromPiAiMessage(finalMessage, normalizedModelId);
-  const anthropicResponse = openAIToAnthropic(openAIResponse);
-  writeJSON(res, 200, anthropicResponse);
+    const piEvents = streamCloudCodeSSEAsPiEvents(upstreamResponse, normalizedModelId);
+    if (stream) {
+      try {
+        const relay = await relayPiAiStreamAsAnthropicSSE(piEvents, res, normalizedModelId);
+        if (!relay.started && relay.errorMessage) {
+          throw new Error(relay.errorMessage);
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : 'Cloud Code Assist stream failed';
+        if (res.headersSent) {
+          emitSSE(res, 'error', createAnthropicErrorBody(message));
+          res.end();
+          return;
+        }
+        throw error;
+      }
+      return;
+    }
+
+    const finalMessage = await collectPiAiFinalMessage(piEvents);
+    const openAIResponse = buildOpenAIResponseFromPiAiMessage(finalMessage, normalizedModelId);
+    const anthropicResponse = openAIToAnthropic(openAIResponse);
+    writeJSON(res, 200, anthropicResponse);
+  } finally {
+    clearTimeout(requestAbortTimer);
+  }
 }
 
 function mapPiAiStopReasonToOpenAIFinishReason(rawReason: unknown): 'stop' | 'length' | 'tool_calls' {
