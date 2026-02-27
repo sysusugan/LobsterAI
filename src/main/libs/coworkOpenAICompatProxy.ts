@@ -23,6 +23,7 @@ export type OpenAICompatUpstreamConfig = {
   model: string;
   provider?: string;
   upstreamKind?: 'openai' | 'antigravity';
+  endpointMode?: 'openai-chat' | 'cloudcode-sse';
   providerModelId?: string;
   resolveAuthApiKey?: (forceRefresh?: boolean) => Promise<string>;
 };
@@ -34,6 +35,7 @@ export type OpenAICompatProxyStatus = {
   upstreamBaseURL: string | null;
   upstreamModel: string | null;
   upstreamKind: 'openai' | 'antigravity' | null;
+  endpointMode: 'openai-chat' | 'cloudcode-sse' | null;
   lastError: string | null;
 };
 
@@ -52,13 +54,24 @@ type StreamState = {
   hasMessageStart: boolean;
   hasMessageStop: boolean;
   toolCalls: Record<number, ToolCallState>;
+  inThinkTag: boolean;
+  thinkTagCarry: string;
 };
+
+type ThinkTagParserState = Pick<StreamState, 'inThinkTag' | 'thinkTagCarry'>;
 
 const LOCAL_HOST = '127.0.0.1';
 const DEFAULT_PI_MODEL_MAX_TOKENS = 65536;
 const DEFAULT_PI_MODEL_CONTEXT_WINDOW = 1048576;
 const DEFAULT_ANTIGRAVITY_REQUEST_TIMEOUT_MS = 120000;
 const BASE64_THOUGHT_SIGNATURE_RE = /^[A-Za-z0-9+/]+={0,2}$/;
+const CLOUD_CODE_PROD_ENDPOINT = 'https://cloudcode-pa.googleapis.com';
+const CLOUD_CODE_DAILY_ENDPOINT = 'https://daily-cloudcode-pa.sandbox.googleapis.com';
+const DEFAULT_ANTIGRAVITY_VERSION = '1.15.8';
+const ANTIGRAVITY_SYSTEM_INSTRUCTION = 'You are Antigravity, a powerful agentic AI coding assistant designed by the Google Deepmind team working on Advanced Agentic Coding.'
+  + 'You are pair programming with a USER to solve their coding task. The task may require creating a new codebase, modifying or debugging an existing codebase, or simply answering a question.'
+  + '**Absolute paths only**'
+  + '**Proactiveness**';
 
 let proxyServer: http.Server | null = null;
 let proxyPort: number | null = null;
@@ -66,6 +79,7 @@ let upstreamConfig: OpenAICompatUpstreamConfig | null = null;
 let lastProxyError: string | null = null;
 const toolCallExtraContentById = new Map<string, unknown>();
 const MAX_TOOL_CALL_EXTRA_CONTENT_CACHE = 1024;
+let cloudCodeToolCallCounter = 0;
 
 // --- Scheduled task API dependencies ---
 interface ScheduledTaskDeps {
@@ -235,10 +249,15 @@ function extractErrorMessage(raw: string): string {
     // noop
   }
 
-  return raw;
+  const trimmed = raw.trim();
+  if (/^<!doctype html\b/i.test(trimmed) || /^<html\b/i.test(trimmed)) {
+    return 'Upstream returned an HTML error page. Please verify API base URL and endpoint configuration.';
+  }
+
+  return trimmed;
 }
 
-function buildUpstreamTargetUrls(baseURL: string): string[] {
+function buildOpenAIChatTargetUrls(baseURL: string): string[] {
   const primary = buildOpenAIChatCompletionsURL(baseURL);
   const urls = new Set<string>([primary]);
 
@@ -251,6 +270,76 @@ function buildUpstreamTargetUrls(baseURL: string): string[] {
   }
 
   return Array.from(urls);
+}
+
+function normalizeCloudCodeEndpointBase(baseURL: string): string {
+  const trimmed = baseURL.trim().replace(/\/+$/, '');
+  if (!trimmed) {
+    return CLOUD_CODE_DAILY_ENDPOINT;
+  }
+
+  try {
+    const parsed = new URL(trimmed);
+    const lowerPath = parsed.pathname.toLowerCase().replace(/\/+$/, '');
+    if (
+      !lowerPath
+      || lowerPath === '/'
+      || lowerPath === '/v1'
+      || lowerPath === '/v1beta'
+      || lowerPath === '/v1/openai'
+      || lowerPath === '/v1beta/openai'
+    ) {
+      return `${parsed.protocol}//${parsed.host}`;
+    }
+    return `${parsed.protocol}//${parsed.host}${parsed.pathname.replace(/\/+$/, '')}`;
+  } catch {
+    return trimmed;
+  }
+}
+
+function buildCloudCodeStreamGenerateContentURLs(baseURL: string): string[] {
+  const normalizedBase = normalizeCloudCodeEndpointBase(baseURL);
+  if (normalizedBase.includes('/v1internal:streamGenerateContent')) {
+    const url = normalizedBase.includes('?')
+      ? normalizedBase
+      : `${normalizedBase}?alt=sse`;
+    return [url];
+  }
+
+  const urls = new Set<string>([
+    `${normalizedBase}/v1internal:streamGenerateContent?alt=sse`,
+  ]);
+
+  if (normalizedBase.includes('daily-cloudcode-pa.sandbox.googleapis.com')) {
+    urls.add(`${CLOUD_CODE_PROD_ENDPOINT}/v1internal:streamGenerateContent?alt=sse`);
+  } else if (normalizedBase.includes('cloudcode-pa.googleapis.com')) {
+    urls.add(`${CLOUD_CODE_DAILY_ENDPOINT}/v1internal:streamGenerateContent?alt=sse`);
+  }
+
+  return Array.from(urls);
+}
+
+function buildUpstreamTargetUrls(
+  baseURL: string,
+  endpointMode: 'openai-chat' | 'cloudcode-sse'
+): string[] {
+  if (endpointMode === 'cloudcode-sse') {
+    return buildCloudCodeStreamGenerateContentURLs(baseURL);
+  }
+  return buildOpenAIChatTargetUrls(baseURL);
+}
+
+function getAntigravityHeaders(): Record<string, string> {
+  const version = process.env.PI_AI_ANTIGRAVITY_VERSION || DEFAULT_ANTIGRAVITY_VERSION;
+  return {
+    'User-Agent': `antigravity/${version} darwin/arm64`,
+    'X-Goog-Api-Client': 'google-cloud-sdk vscode_cloudshelleditor/0.1',
+    'Client-Metadata': JSON.stringify({
+      ideType: 'IDE_UNSPECIFIED',
+      platform: 'PLATFORM_UNSPECIFIED',
+      pluginType: 'GEMINI',
+    }),
+  };
 }
 
 function extractMaxTokensRange(errorMessage: string): { min: number; max: number } | null {
@@ -306,6 +395,370 @@ function clampMaxTokensFromError(
 
   openAIRequest.max_tokens = nextValue;
   return { changed: true, clampedTo: nextValue };
+}
+
+const STRICT_TOOL_SCHEMA_NUMERIC_KEYS = [
+  'minimum',
+  'maximum',
+  'minLength',
+  'maxLength',
+  'minItems',
+  'maxItems',
+] as const;
+
+function sanitizeToolSchemaForStrictProvider(rawSchema: unknown): Record<string, unknown> {
+  const source = toOptionalObject(rawSchema) || {};
+  const sanitized: Record<string, unknown> = {};
+
+  const type = toString(source.type);
+  if (type) {
+    sanitized.type = type;
+  }
+
+  const description = toString(source.description);
+  if (description) {
+    sanitized.description = description;
+  }
+
+  if (Array.isArray(source.required)) {
+    sanitized.required = source.required.filter(
+      (item): item is string => typeof item === 'string' && item.trim().length > 0
+    );
+  }
+
+  if (Array.isArray(source.enum)) {
+    sanitized.enum = source.enum.filter((item) => {
+      const valueType = typeof item;
+      return valueType === 'string' || valueType === 'number' || valueType === 'boolean' || item === null;
+    });
+  }
+
+  const properties = toOptionalObject(source.properties);
+  if (properties) {
+    const sanitizedProperties: Record<string, unknown> = {};
+    for (const [propertyName, propertySchema] of Object.entries(properties)) {
+      sanitizedProperties[propertyName] = sanitizeToolSchemaForStrictProvider(propertySchema);
+    }
+    sanitized.properties = sanitizedProperties;
+    if (!sanitized.type) {
+      sanitized.type = 'object';
+    }
+  }
+
+  if (source.items !== undefined) {
+    const itemsSchema = Array.isArray(source.items) ? source.items[0] : source.items;
+    sanitized.items = sanitizeToolSchemaForStrictProvider(itemsSchema);
+    if (!sanitized.type) {
+      sanitized.type = 'array';
+    }
+  }
+
+  const additionalProperties = source.additionalProperties;
+  if (typeof additionalProperties === 'boolean') {
+    sanitized.additionalProperties = additionalProperties;
+  } else if (additionalProperties && typeof additionalProperties === 'object') {
+    sanitized.additionalProperties = sanitizeToolSchemaForStrictProvider(additionalProperties);
+  }
+
+  for (const key of STRICT_TOOL_SCHEMA_NUMERIC_KEYS) {
+    const value = source[key];
+    if (typeof value === 'number' && Number.isFinite(value)) {
+      sanitized[key] = value;
+    }
+  }
+
+  if (!sanitized.type) {
+    sanitized.type = 'object';
+  }
+
+  return sanitized;
+}
+
+function normalizeMessageContentForStrictProvider(content: unknown): string | null {
+  if (typeof content === 'string') {
+    return content;
+  }
+
+  if (content === null || content === undefined) {
+    return '';
+  }
+
+  const parts = toArray(content);
+  if (parts.length === 0) {
+    return '';
+  }
+
+  const textParts: string[] = [];
+  for (const part of parts) {
+    if (typeof part === 'string') {
+      if (part) {
+        textParts.push(part);
+      }
+      continue;
+    }
+
+    const partObj = toOptionalObject(part);
+    if (!partObj) {
+      continue;
+    }
+
+    const text = toString(partObj.text);
+    if (text) {
+      textParts.push(text);
+    }
+  }
+
+  return textParts.join('\n');
+}
+
+function isLikelyInvalidChatSettingError(errorMessage: string): boolean {
+  const normalized = errorMessage.toLowerCase();
+  return normalized.includes('invalid chat setting')
+    || normalized.includes('invalid params')
+    || normalized.includes('(2013)');
+}
+
+function summarizeOpenAIRequestForLog(openAIRequest: Record<string, unknown>): Record<string, unknown> {
+  const messages = toArray(openAIRequest.messages);
+  const tools = toArray(openAIRequest.tools);
+  const roles: Record<string, number> = {};
+  let assistantMessagesWithToolCalls = 0;
+
+  for (const message of messages) {
+    const messageObj = toOptionalObject(message);
+    const role = toString(messageObj?.role) || 'unknown';
+    roles[role] = (roles[role] || 0) + 1;
+    if (role === 'assistant' && toArray(messageObj?.tool_calls).length > 0) {
+      assistantMessagesWithToolCalls += 1;
+    }
+  }
+
+  return {
+    model: toString(openAIRequest.model),
+    stream: openAIRequest.stream === true,
+    max_tokens: typeof openAIRequest.max_tokens === 'number' ? openAIRequest.max_tokens : null,
+    temperature: typeof openAIRequest.temperature === 'number' ? openAIRequest.temperature : null,
+    top_p: typeof openAIRequest.top_p === 'number' ? openAIRequest.top_p : null,
+    has_stop: openAIRequest.stop !== undefined,
+    has_tool_choice: openAIRequest.tool_choice !== undefined,
+    messages_count: messages.length,
+    roles,
+    assistant_messages_with_tool_calls: assistantMessagesWithToolCalls,
+    tools_count: tools.length,
+  };
+}
+
+function shouldMergeSystemMessages(provider: string | undefined): boolean {
+  return (provider || '').trim().toLowerCase() === 'minimax';
+}
+
+function mergeSystemMessagesForProvider(
+  openAIRequest: Record<string, unknown>,
+  provider: string | undefined
+): { changed: boolean; before: number; after: number } {
+  if (!shouldMergeSystemMessages(provider)) {
+    const messages = toArray(openAIRequest.messages);
+    const before = messages.filter((rawMessage) => {
+      const messageObj = toOptionalObject(rawMessage);
+      return toString(messageObj?.role) === 'system';
+    }).length;
+    return { changed: false, before, after: before };
+  }
+
+  const messages = toArray(openAIRequest.messages);
+  if (messages.length === 0) {
+    return { changed: false, before: 0, after: 0 };
+  }
+
+  const nextMessages: Array<Record<string, unknown>> = [];
+  const systemContents: string[] = [];
+  let firstSystemIndex = -1;
+  let before = 0;
+
+  for (const rawMessage of messages) {
+    const messageObj = toOptionalObject(rawMessage);
+    if (!messageObj) {
+      continue;
+    }
+
+    const role = toString(messageObj.role);
+    if (!role) {
+      continue;
+    }
+
+    if (role !== 'system') {
+      nextMessages.push(messageObj);
+      continue;
+    }
+
+    before += 1;
+    const content = normalizeMessageContentForStrictProvider(messageObj.content);
+    if (content && content.trim().length > 0) {
+      systemContents.push(content.trim());
+    }
+
+    if (firstSystemIndex < 0) {
+      firstSystemIndex = nextMessages.length;
+      nextMessages.push({
+        role: 'system',
+        content: '',
+      });
+    }
+  }
+
+  if (firstSystemIndex >= 0) {
+    nextMessages[firstSystemIndex] = {
+      role: 'system',
+      content: systemContents.join('\n\n'),
+    };
+  }
+
+  const after = firstSystemIndex >= 0 ? 1 : 0;
+  if (before > 1 || nextMessages.length !== messages.length) {
+    openAIRequest.messages = nextMessages;
+    return { changed: before !== after, before, after };
+  }
+
+  return { changed: false, before, after };
+}
+
+function applyStrictProviderRetryAdjustments(
+  openAIRequest: Record<string, unknown>,
+  provider: string | undefined
+): string[] {
+  const changes: string[] = [];
+  const removableKeys = [
+    'temperature',
+    'top_p',
+    'stop',
+    'tool_choice',
+    'frequency_penalty',
+    'presence_penalty',
+    'response_format',
+    'parallel_tool_calls',
+    'logit_bias',
+    'seed',
+  ];
+
+  for (const key of removableKeys) {
+    if (openAIRequest[key] !== undefined) {
+      delete openAIRequest[key];
+      changes.push(`drop:${key}`);
+    }
+  }
+
+  if (typeof openAIRequest.max_tokens === 'number' && Number.isFinite(openAIRequest.max_tokens)) {
+    const normalizedMaxTokens = Math.floor(openAIRequest.max_tokens);
+    if (normalizedMaxTokens <= 0) {
+      openAIRequest.max_tokens = 8192;
+      changes.push('set:max_tokens=8192');
+    } else if (normalizedMaxTokens > 196608) {
+      openAIRequest.max_tokens = 196608;
+      changes.push('clamp:max_tokens=196608');
+    } else if (normalizedMaxTokens !== openAIRequest.max_tokens) {
+      openAIRequest.max_tokens = normalizedMaxTokens;
+      changes.push(`round:max_tokens=${normalizedMaxTokens}`);
+    }
+  }
+
+  const tools = toArray(openAIRequest.tools);
+  if (tools.length > 0) {
+    const nextTools: Array<Record<string, unknown>> = [];
+    for (const tool of tools) {
+      const toolObj = toOptionalObject(tool);
+      const functionObj = toOptionalObject(toolObj?.function);
+      const toolName = toString(functionObj?.name);
+      if (!toolName) {
+        continue;
+      }
+
+      const normalizedTool: Record<string, unknown> = {
+        type: 'function',
+        function: {
+          name: toolName,
+          description: toString(functionObj?.description),
+          parameters: sanitizeToolSchemaForStrictProvider(functionObj?.parameters),
+        },
+      };
+      nextTools.push(normalizedTool);
+    }
+
+    if (nextTools.length !== tools.length) {
+      changes.push(`filter:tools=${tools.length}->${nextTools.length}`);
+    } else {
+      changes.push('sanitize:tools.parameters');
+    }
+    openAIRequest.tools = nextTools;
+  }
+
+  const messages = toArray(openAIRequest.messages);
+  if (messages.length > 0) {
+    const nextMessages: Array<Record<string, unknown>> = [];
+    for (const message of messages) {
+      const messageObj = toOptionalObject(message);
+      if (!messageObj) {
+        continue;
+      }
+
+      const role = toString(messageObj.role);
+      if (!role) {
+        continue;
+      }
+
+      const normalizedMessage: Record<string, unknown> = { role };
+      if (role === 'tool') {
+        normalizedMessage.content = normalizeMessageContentForStrictProvider(messageObj.content);
+        const toolCallId = toString(messageObj.tool_call_id);
+        if (toolCallId) {
+          normalizedMessage.tool_call_id = toolCallId;
+        }
+      } else if (role === 'assistant') {
+        normalizedMessage.content = normalizeMessageContentForStrictProvider(messageObj.content);
+        const toolCalls = toArray(messageObj.tool_calls)
+          .map((rawToolCall) => {
+            const toolCallObj = toOptionalObject(rawToolCall);
+            if (!toolCallObj) {
+              return null;
+            }
+            const functionObj = toOptionalObject(toolCallObj.function);
+            const name = toString(functionObj?.name);
+            if (!name) {
+              return null;
+            }
+            return {
+              id: toString(toolCallObj.id),
+              type: 'function',
+              function: {
+                name,
+                arguments: toString(functionObj?.arguments) || '{}',
+              },
+            };
+          })
+          .filter(Boolean) as Array<Record<string, unknown>>;
+        if (toolCalls.length > 0) {
+          normalizedMessage.tool_calls = toolCalls;
+        }
+      } else {
+        normalizedMessage.content = normalizeMessageContentForStrictProvider(messageObj.content);
+      }
+
+      nextMessages.push(normalizedMessage);
+    }
+
+    if (nextMessages.length !== messages.length) {
+      changes.push(`filter:messages=${messages.length}->${nextMessages.length}`);
+    } else {
+      changes.push('sanitize:messages.content');
+    }
+    openAIRequest.messages = nextMessages;
+  }
+
+  const mergedSystems = mergeSystemMessagesForProvider(openAIRequest, provider);
+  if (mergedSystems.changed) {
+    changes.push(`merge:system=${mergedSystems.before}->${mergedSystems.after}`);
+  }
+
+  return changes;
 }
 
 function writeJSON(
@@ -381,12 +834,13 @@ function buildAnthropicModelObject(id: string): Record<string, unknown> {
 }
 
 function listProxyModels(config: OpenAICompatUpstreamConfig): string[] {
+  const isAntigravityProvider = config.provider === 'antigravity';
   const upstreamKind =
     config.upstreamKind
-    || (config.provider === 'antigravity' ? 'antigravity' : 'openai');
+    || (isAntigravityProvider ? 'antigravity' : 'openai');
   const ids = new Set<string>();
 
-  if (upstreamKind === 'antigravity') {
+  if (isAntigravityProvider || upstreamKind === 'antigravity') {
     const configuredModel = (config.providerModelId || config.model || '').trim();
     if (configuredModel) {
       ids.add(configuredModel);
@@ -913,6 +1367,778 @@ function buildPiAiContextFromOpenAIRequest(
   }
 
   return { context, options };
+}
+
+function requiresCloudCodeToolCallId(modelId: string): boolean {
+  const normalized = modelId.toLowerCase();
+  return normalized.startsWith('claude-') || normalized.startsWith('gpt-oss-');
+}
+
+function mapCloudCodeToolChoice(rawToolChoice: unknown): 'AUTO' | 'NONE' | 'ANY' {
+  const normalized = normalizeToolChoice(rawToolChoice);
+  if (normalized === 'none') {
+    return 'NONE';
+  }
+  if (normalized === 'any') {
+    return 'ANY';
+  }
+  return 'AUTO';
+}
+
+function mapCloudCodeFinishReasonToPiStopReason(rawReason: unknown): 'stop' | 'length' | 'error' {
+  const reason = toString(rawReason);
+  if (reason === 'STOP') {
+    return 'stop';
+  }
+  if (reason === 'MAX_TOKENS') {
+    return 'length';
+  }
+  return 'error';
+}
+
+function convertPiContextMessagesToCloudCodeContents(
+  context: Record<string, unknown>,
+  modelId: string
+): Array<Record<string, unknown>> {
+  const contents: Array<Record<string, unknown>> = [];
+  const supportsImageInput = !modelId.toLowerCase().includes('gpt-oss');
+  const includeToolCallId = requiresCloudCodeToolCallId(modelId);
+  const supportsMultimodalFunctionResponse = modelId.toLowerCase().includes('gemini-3');
+
+  for (const rawMessage of toArray(context.messages)) {
+    const messageObj = toOptionalObject(rawMessage);
+    if (!messageObj) {
+      continue;
+    }
+
+    const role = toString(messageObj.role);
+    if (role === 'user') {
+      const content = messageObj.content;
+      if (typeof content === 'string') {
+        if (!content.trim()) {
+          continue;
+        }
+        contents.push({
+          role: 'user',
+          parts: [{ text: content }],
+        });
+        continue;
+      }
+
+      const userParts: Array<Record<string, unknown>> = [];
+      for (const rawPart of toArray(content)) {
+        const partObj = toOptionalObject(rawPart);
+        if (!partObj) {
+          continue;
+        }
+
+        const partType = toString(partObj.type);
+        if (partType === 'text') {
+          const text = toString(partObj.text);
+          if (text) {
+            userParts.push({ text });
+          }
+          continue;
+        }
+
+        if (partType === 'image' && supportsImageInput) {
+          const mimeType = toString(partObj.mimeType) || 'image/png';
+          const data = toString(partObj.data);
+          if (data) {
+            userParts.push({
+              inlineData: {
+                mimeType,
+                data,
+              },
+            });
+          }
+        }
+      }
+
+      if (userParts.length > 0) {
+        contents.push({
+          role: 'user',
+          parts: userParts,
+        });
+      }
+      continue;
+    }
+
+    if (role === 'assistant') {
+      const assistantParts: Array<Record<string, unknown>> = [];
+      for (const rawBlock of toArray(messageObj.content)) {
+        const blockObj = toOptionalObject(rawBlock);
+        if (!blockObj) {
+          continue;
+        }
+
+        const blockType = toString(blockObj.type);
+        if (blockType === 'text') {
+          const text = toString(blockObj.text);
+          if (!text.trim()) {
+            continue;
+          }
+          const textPart: Record<string, unknown> = { text };
+          const textSignature = toString(blockObj.textSignature);
+          if (isValidThoughtSignature(textSignature)) {
+            textPart.thoughtSignature = textSignature;
+          }
+          assistantParts.push(textPart);
+          continue;
+        }
+
+        if (blockType === 'thinking') {
+          const thinking = toString(blockObj.thinking);
+          if (!thinking.trim()) {
+            continue;
+          }
+          const thinkingPart: Record<string, unknown> = {
+            thought: true,
+            text: thinking,
+          };
+          const thinkingSignature = toString(blockObj.thinkingSignature);
+          if (isValidThoughtSignature(thinkingSignature)) {
+            thinkingPart.thoughtSignature = thinkingSignature;
+          }
+          assistantParts.push(thinkingPart);
+          continue;
+        }
+
+        if (blockType === 'toolCall') {
+          const toolName = toString(blockObj.name);
+          if (!toolName) {
+            continue;
+          }
+          const toolArgs = toOptionalObject(blockObj.arguments) || {};
+          const rawToolId = toString(blockObj.id);
+          const toolCallId = rawToolId || `${toolName}_${Date.now()}_${++cloudCodeToolCallCounter}`;
+
+          const functionCall: Record<string, unknown> = {
+            name: toolName,
+            args: toolArgs,
+          };
+          if (includeToolCallId) {
+            functionCall.id = toolCallId;
+          }
+
+          const toolPart: Record<string, unknown> = {
+            functionCall,
+          };
+          const thoughtSignature = toString(blockObj.thoughtSignature);
+          if (isValidThoughtSignature(thoughtSignature)) {
+            toolPart.thoughtSignature = thoughtSignature;
+          }
+          assistantParts.push(toolPart);
+        }
+      }
+
+      if (assistantParts.length > 0) {
+        contents.push({
+          role: 'model',
+          parts: assistantParts,
+        });
+      }
+      continue;
+    }
+
+    if (role === 'toolResult') {
+      const toolCallId = toString(messageObj.toolCallId);
+      const toolName = toString(messageObj.toolName) || 'tool';
+      const isError = messageObj.isError === true;
+      if (!toolCallId || !toolName) {
+        continue;
+      }
+
+      const textParts = toArray(messageObj.content)
+        .map((rawPart) => toOptionalObject(rawPart))
+        .filter((partObj): partObj is Record<string, unknown> => Boolean(partObj))
+        .filter((partObj) => toString(partObj.type) === 'text')
+        .map((partObj) => toString(partObj.text))
+        .filter((text) => text.length > 0);
+
+      const imageParts: Array<Record<string, unknown>> = supportsImageInput
+        ? toArray(messageObj.content)
+          .map((rawPart) => toOptionalObject(rawPart))
+          .filter((partObj): partObj is Record<string, unknown> => Boolean(partObj))
+          .filter((partObj) => toString(partObj.type) === 'image')
+          .map((partObj) => {
+            const data = toString(partObj.data);
+            if (!data) {
+              return null;
+            }
+            return {
+              inlineData: {
+                mimeType: toString(partObj.mimeType) || 'image/png',
+                data,
+              },
+            };
+          })
+          .filter((part) => Boolean(part)) as Array<Record<string, unknown>>
+        : [];
+
+      const textResult = textParts.join('\n');
+      const responseValue = textResult || (imageParts.length > 0 ? '(see attached image)' : '');
+      const functionResponse: Record<string, unknown> = {
+        name: toolName,
+        response: isError ? { error: responseValue } : { output: responseValue },
+      };
+      if (includeToolCallId) {
+        functionResponse.id = toolCallId;
+      }
+      if (imageParts.length > 0 && supportsMultimodalFunctionResponse) {
+        functionResponse.parts = imageParts;
+      }
+
+      const functionResponsePart = { functionResponse };
+      const lastContent = contents[contents.length - 1];
+      const lastParts = toArray(lastContent?.parts);
+      const canMergeToLastUser = lastContent?.role === 'user'
+        && lastParts.some((part) => Boolean(toOptionalObject(part)?.functionResponse));
+      if (canMergeToLastUser) {
+        lastParts.push(functionResponsePart);
+        lastContent.parts = lastParts;
+      } else {
+        contents.push({
+          role: 'user',
+          parts: [functionResponsePart],
+        });
+      }
+
+      if (imageParts.length > 0 && !supportsMultimodalFunctionResponse) {
+        contents.push({
+          role: 'user',
+          parts: [{ text: 'Tool result image:' }, ...imageParts],
+        });
+      }
+    }
+  }
+
+  return contents;
+}
+
+function buildCloudCodeAssistRequestBody(
+  openAIRequest: Record<string, unknown>,
+  modelId: string,
+  projectId: string
+): Record<string, unknown> {
+  const { context, options } = buildPiAiContextFromOpenAIRequest(openAIRequest, modelId);
+  const contextObj = toOptionalObject(context) || {};
+  const optionsObj = toOptionalObject(options) || {};
+  const requestBody: Record<string, unknown> = {
+    project: projectId,
+    model: modelId,
+    requestType: 'agent',
+    userAgent: 'antigravity',
+    requestId: `agent-${Date.now()}-${Math.random().toString(36).slice(2, 11)}`,
+    request: {
+      contents: convertPiContextMessagesToCloudCodeContents(contextObj, modelId),
+    },
+  };
+
+  const requestObj = toOptionalObject(requestBody.request) || {};
+
+  const generationConfig: Record<string, unknown> = {};
+  if (typeof optionsObj.maxTokens === 'number' && Number.isFinite(optionsObj.maxTokens)) {
+    generationConfig.maxOutputTokens = optionsObj.maxTokens;
+  }
+  if (typeof optionsObj.temperature === 'number' && Number.isFinite(optionsObj.temperature)) {
+    generationConfig.temperature = optionsObj.temperature;
+  }
+  if (Object.keys(generationConfig).length > 0) {
+    requestObj.generationConfig = generationConfig;
+  }
+
+  const tools: Array<Record<string, unknown>> = toArray(contextObj.tools)
+    .map((rawTool) => toOptionalObject(rawTool))
+    .filter((toolObj): toolObj is Record<string, unknown> => Boolean(toolObj))
+    .map((toolObj) => {
+      const name = toString(toolObj.name);
+      if (!name) {
+        return null;
+      }
+      const parameters = sanitizeSchemaForCloudCodeAssist(toolObj.parameters);
+      const useParameters = modelId.toLowerCase().startsWith('claude-');
+      return {
+        name,
+        description: toString(toolObj.description),
+        ...(useParameters
+          ? { parameters }
+          : { parametersJsonSchema: parameters }),
+      };
+    })
+    .filter((tool) => Boolean(tool)) as Array<Record<string, unknown>>;
+
+  if (tools.length > 0) {
+    requestObj.tools = [{ functionDeclarations: tools }];
+    requestObj.toolConfig = {
+      functionCallingConfig: {
+        mode: mapCloudCodeToolChoice(optionsObj.toolChoice),
+      },
+    };
+  }
+
+  const systemPrompt = toString(contextObj.systemPrompt);
+  const systemParts: Array<Record<string, unknown>> = [
+    { text: ANTIGRAVITY_SYSTEM_INSTRUCTION },
+    { text: `Please ignore following [ignore]${ANTIGRAVITY_SYSTEM_INSTRUCTION}[/ignore]` },
+  ];
+  if (systemPrompt.trim()) {
+    systemParts.push({ text: systemPrompt });
+  }
+  requestObj.systemInstruction = {
+    role: 'user',
+    parts: systemParts,
+  };
+
+  requestBody.request = requestObj;
+  return requestBody;
+}
+
+async function* streamCloudCodeSSEAsPiEvents(
+  response: Response,
+  modelId: string
+): AsyncGenerator<Record<string, unknown>> {
+  if (!response.body) {
+    throw new Error('Cloud Code Assist API returned no response body');
+  }
+
+  const outputMessage: Record<string, unknown> = {
+    role: 'assistant',
+    content: [],
+    api: 'google-gemini-cli',
+    provider: 'google-antigravity',
+    model: modelId,
+    usage: {
+      input: 0,
+      output: 0,
+      cacheRead: 0,
+      cacheWrite: 0,
+      totalTokens: 0,
+      cost: {
+        input: 0,
+        output: 0,
+        cacheRead: 0,
+        cacheWrite: 0,
+        total: 0,
+      },
+    },
+    stopReason: 'stop',
+    timestamp: Date.now(),
+  };
+
+  const contentBlocks = toArray(outputMessage.content);
+  const seenToolCallIds = new Set<string>();
+  const includeToolCallId = requiresCloudCodeToolCallId(modelId);
+  let currentTextBlock: Record<string, unknown> | null = null;
+  let currentThinkingBlock: Record<string, unknown> | null = null;
+  const thinkTagState: Pick<StreamState, 'inThinkTag' | 'thinkTagCarry'> = {
+    inThinkTag: false,
+    thinkTagCarry: '',
+  };
+  let started = false;
+  let hasContent = false;
+  let sawToolCall = false;
+  let stopReason: 'stop' | 'length' | 'toolUse' | 'error' = 'stop';
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) {
+      break;
+    }
+
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split('\n');
+    buffer = lines.pop() || '';
+
+    for (const line of lines) {
+      if (!line.startsWith('data:')) {
+        continue;
+      }
+      const jsonStr = line.slice(5).trim();
+      if (!jsonStr) {
+        continue;
+      }
+
+      let chunk: unknown;
+      try {
+        chunk = JSON.parse(jsonStr);
+      } catch {
+        continue;
+      }
+
+      const chunkObj = toOptionalObject(chunk);
+      const responseData = toOptionalObject(chunkObj?.response);
+      if (!responseData) {
+        continue;
+      }
+
+      const candidate = toOptionalObject(toArray(responseData.candidates)[0]);
+      if (candidate) {
+        const contentObj = toOptionalObject(candidate.content);
+        const parts = toArray(contentObj?.parts);
+        for (const rawPart of parts) {
+          const partObj = toOptionalObject(rawPart);
+          if (!partObj) {
+            continue;
+          }
+
+          const partText = typeof partObj.text === 'string' ? partObj.text : '';
+          if (partText) {
+            hasContent = true;
+            if (!started) {
+              started = true;
+              yield { type: 'start' };
+            }
+
+            const isThinking = partObj.thought === true;
+            const thoughtSignature = toString(partObj.thoughtSignature);
+
+            if (isThinking) {
+              if (!currentThinkingBlock) {
+                currentThinkingBlock = {
+                  type: 'thinking',
+                  thinking: '',
+                };
+                contentBlocks.push(currentThinkingBlock);
+              }
+              currentTextBlock = null;
+              currentThinkingBlock.thinking = `${toString(currentThinkingBlock.thinking)}${partText}`;
+              if (isValidThoughtSignature(thoughtSignature)) {
+                currentThinkingBlock.thinkingSignature = thoughtSignature;
+              }
+              yield {
+                type: 'thinking_delta',
+                delta: partText,
+              };
+            } else {
+              const segments = splitTextByThinkTags(thinkTagState, partText);
+              for (const segment of segments) {
+                if (!segment.value) {
+                  continue;
+                }
+                if (segment.type === 'thinking') {
+                  if (!currentThinkingBlock) {
+                    currentThinkingBlock = {
+                      type: 'thinking',
+                      thinking: '',
+                    };
+                    contentBlocks.push(currentThinkingBlock);
+                  }
+                  currentTextBlock = null;
+                  currentThinkingBlock.thinking = `${toString(currentThinkingBlock.thinking)}${segment.value}`;
+                  yield {
+                    type: 'thinking_delta',
+                    delta: segment.value,
+                  };
+                  continue;
+                }
+
+                if (!currentTextBlock) {
+                  currentTextBlock = {
+                    type: 'text',
+                    text: '',
+                  };
+                  contentBlocks.push(currentTextBlock);
+                }
+                currentThinkingBlock = null;
+                currentTextBlock.text = `${toString(currentTextBlock.text)}${segment.value}`;
+                yield {
+                  type: 'text_delta',
+                  delta: segment.value,
+                };
+              }
+              if (isValidThoughtSignature(thoughtSignature) && currentTextBlock) {
+                currentTextBlock.textSignature = thoughtSignature;
+              }
+            }
+          }
+
+          const functionCall = toOptionalObject(partObj.functionCall);
+          if (functionCall) {
+            hasContent = true;
+            if (!started) {
+              started = true;
+              yield { type: 'start' };
+            }
+
+            currentTextBlock = null;
+            currentThinkingBlock = null;
+            const toolName = toString(functionCall.name) || 'tool';
+            const rawToolId = toString(functionCall.id);
+            let toolCallId = rawToolId || `${toolName}_${Date.now()}_${++cloudCodeToolCallCounter}`;
+            if (seenToolCallIds.has(toolCallId)) {
+              toolCallId = `${toolName}_${Date.now()}_${++cloudCodeToolCallCounter}`;
+            }
+            seenToolCallIds.add(toolCallId);
+
+            const toolArguments = toOptionalObject(functionCall.args) || {};
+            const thoughtSignature = toString(partObj.thoughtSignature);
+            const toolCallBlock: Record<string, unknown> = {
+              type: 'toolCall',
+              id: toolCallId,
+              name: toolName,
+              arguments: toolArguments,
+            };
+            if (isValidThoughtSignature(thoughtSignature)) {
+              toolCallBlock.thoughtSignature = thoughtSignature;
+            }
+            contentBlocks.push(toolCallBlock);
+            sawToolCall = true;
+
+            const toolCallEvent: Record<string, unknown> = {
+              id: toolCallId,
+              name: toolName,
+              arguments: toolArguments,
+            };
+            if (isValidThoughtSignature(thoughtSignature)) {
+              toolCallEvent.thoughtSignature = thoughtSignature;
+            }
+            if (!includeToolCallId) {
+              delete toolCallEvent.id;
+            }
+
+            yield {
+              type: 'toolcall_end',
+              toolCall: toolCallEvent,
+            };
+          }
+        }
+
+        const mappedStopReason = mapCloudCodeFinishReasonToPiStopReason(candidate.finishReason);
+        if (mappedStopReason !== 'error') {
+          stopReason = mappedStopReason;
+        }
+      }
+
+      const usageMetadata = toOptionalObject(responseData.usageMetadata);
+      if (usageMetadata) {
+        const promptTokens = Number(usageMetadata.promptTokenCount) || 0;
+        const cacheReadTokens = Number(usageMetadata.cachedContentTokenCount) || 0;
+        const outputTokens = (Number(usageMetadata.candidatesTokenCount) || 0)
+          + (Number(usageMetadata.thoughtsTokenCount) || 0);
+        outputMessage.usage = {
+          input: Math.max(0, promptTokens - cacheReadTokens),
+          output: outputTokens,
+          cacheRead: cacheReadTokens,
+          cacheWrite: 0,
+          totalTokens: Number(usageMetadata.totalTokenCount) || (promptTokens + outputTokens),
+          cost: {
+            input: 0,
+            output: 0,
+            cacheRead: 0,
+            cacheWrite: 0,
+            total: 0,
+          },
+        };
+      }
+    }
+  }
+
+  if (thinkTagState.thinkTagCarry) {
+    const tail = thinkTagState.thinkTagCarry;
+    thinkTagState.thinkTagCarry = '';
+    if (tail) {
+      hasContent = true;
+      if (!started) {
+        started = true;
+        yield { type: 'start' };
+      }
+      if (thinkTagState.inThinkTag) {
+        if (!currentThinkingBlock) {
+          currentThinkingBlock = {
+            type: 'thinking',
+            thinking: '',
+          };
+          contentBlocks.push(currentThinkingBlock);
+        }
+        currentTextBlock = null;
+        currentThinkingBlock.thinking = `${toString(currentThinkingBlock.thinking)}${tail}`;
+        yield {
+          type: 'thinking_delta',
+          delta: tail,
+        };
+        thinkTagState.inThinkTag = false;
+      } else {
+        if (!currentTextBlock) {
+          currentTextBlock = {
+            type: 'text',
+            text: '',
+          };
+          contentBlocks.push(currentTextBlock);
+        }
+        currentThinkingBlock = null;
+        currentTextBlock.text = `${toString(currentTextBlock.text)}${tail}`;
+        yield {
+          type: 'text_delta',
+          delta: tail,
+        };
+      }
+    }
+  }
+
+  if (!hasContent) {
+    throw new Error('Cloud Code Assist API returned an empty response');
+  }
+
+  if (sawToolCall) {
+    stopReason = 'toolUse';
+  }
+
+  outputMessage.content = contentBlocks;
+  outputMessage.stopReason = stopReason;
+  yield {
+    type: 'done',
+    reason: stopReason,
+    message: outputMessage,
+  };
+}
+
+async function handleCloudCodeAssistRequest(
+  openAIRequest: Record<string, unknown>,
+  stream: boolean,
+  res: http.ServerResponse,
+  config: OpenAICompatUpstreamConfig,
+  authHeaders: Record<string, string>,
+  applyUpstreamAuthHeaders: (forceRefresh?: boolean) => Promise<void>,
+  getCurrentProjectId: () => string
+): Promise<void> {
+  const requestedModel = typeof openAIRequest.model === 'string'
+    ? openAIRequest.model
+    : config.providerModelId || config.model;
+  const normalizedModelId = normalizeAntigravityModelId(requestedModel);
+  const projectId = toString(getCurrentProjectId());
+  if (!projectId) {
+    throw new Error('Antigravity project id is missing. Please reconnect OAuth.');
+  }
+
+  const requestBody = buildCloudCodeAssistRequestBody(openAIRequest, normalizedModelId, projectId);
+  const targetURLs = buildCloudCodeStreamGenerateContentURLs(config.baseURL);
+  const baseRequestHeaders = {
+    'Content-Type': 'application/json',
+    Accept: 'text/event-stream',
+    ...getAntigravityHeaders(),
+  };
+
+  const send = async (targetURL: string, includeUserProjectHeader: boolean): Promise<Response> => {
+    const nextProjectId = toString(getCurrentProjectId());
+    if (nextProjectId) {
+      requestBody.project = nextProjectId;
+    }
+    return session.defaultSession.fetch(targetURL, {
+      method: 'POST',
+      headers: {
+        ...baseRequestHeaders,
+        ...authHeaders,
+        ...(includeUserProjectHeader && nextProjectId
+          ? { 'x-goog-user-project': nextProjectId }
+          : {}),
+      },
+      body: JSON.stringify(requestBody),
+    });
+  };
+
+  let currentTargetURL = targetURLs[0];
+  let upstreamResponse: Response | null = null;
+  let upstreamErrorText = '';
+  let includeUserProjectHeader = false;
+
+  const shouldRetryWithProjectHeader = (statusCode: number, rawErrorText: string): boolean => {
+    if (statusCode !== 400 && statusCode !== 403) {
+      return false;
+    }
+    const normalized = rawErrorText.toLowerCase();
+    return normalized.includes('x-goog-user-project')
+      || normalized.includes('x goog user project')
+      || normalized.includes('missing required header')
+      || normalized.includes('quota project');
+  };
+
+  for (let authAttempt = 0; authAttempt < 2; authAttempt += 1) {
+    for (let i = 0; i < targetURLs.length; i += 1) {
+      currentTargetURL = targetURLs[i];
+      upstreamResponse = await send(currentTargetURL, includeUserProjectHeader);
+      if (upstreamResponse.ok) {
+        upstreamErrorText = '';
+        break;
+      }
+
+      upstreamErrorText = await upstreamResponse.text();
+      if (
+        !includeUserProjectHeader
+        && shouldRetryWithProjectHeader(upstreamResponse.status, upstreamErrorText)
+        && Boolean(toString(getCurrentProjectId()))
+      ) {
+        includeUserProjectHeader = true;
+        upstreamResponse = await send(currentTargetURL, includeUserProjectHeader);
+        if (upstreamResponse.ok) {
+          upstreamErrorText = '';
+          break;
+        }
+        upstreamErrorText = await upstreamResponse.text();
+      }
+
+      if (upstreamResponse.status !== 404) {
+        break;
+      }
+    }
+
+    if (!upstreamResponse) {
+      throw new Error('Upstream API request failed');
+    }
+
+    if (upstreamResponse.ok) {
+      break;
+    }
+
+    if (
+      (upstreamResponse.status === 401 || upstreamResponse.status === 403)
+      && authAttempt === 0
+      && config.resolveAuthApiKey
+    ) {
+      await applyUpstreamAuthHeaders(true);
+      const refreshedProjectId = toString(getCurrentProjectId());
+      if (refreshedProjectId) {
+        requestBody.project = refreshedProjectId;
+      }
+      continue;
+    }
+    break;
+  }
+
+  if (!upstreamResponse || !upstreamResponse.ok) {
+    const statusCode = upstreamResponse?.status ?? 502;
+    const errorText = upstreamErrorText || (upstreamResponse ? await upstreamResponse.text() : '');
+    const errorMessage = extractErrorMessage(errorText) || `Cloud Code Assist API error (${statusCode})`;
+    throw new Error(`Cloud Code Assist API error (${statusCode}): ${errorMessage} [${currentTargetURL}]`);
+  }
+
+  const piEvents = streamCloudCodeSSEAsPiEvents(upstreamResponse, normalizedModelId);
+  if (stream) {
+    try {
+      const relay = await relayPiAiStreamAsAnthropicSSE(piEvents, res, normalizedModelId);
+      if (!relay.started && relay.errorMessage) {
+        throw new Error(relay.errorMessage);
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Cloud Code Assist stream failed';
+      if (res.headersSent) {
+        emitSSE(res, 'error', createAnthropicErrorBody(message));
+        res.end();
+        return;
+      }
+      throw error;
+    }
+    return;
+  }
+
+  const finalMessage = await collectPiAiFinalMessage(piEvents);
+  const openAIResponse = buildOpenAIResponseFromPiAiMessage(finalMessage, normalizedModelId);
+  const anthropicResponse = openAIToAnthropic(openAIResponse);
+  writeJSON(res, 200, anthropicResponse);
 }
 
 function mapPiAiStopReasonToOpenAIFinishReason(rawReason: unknown): 'stop' | 'length' | 'tool_calls' {
@@ -1473,6 +2699,8 @@ function createStreamState(): StreamState {
     hasMessageStart: false,
     hasMessageStop: false,
     toolCalls: {},
+    inThinkTag: false,
+    thinkTagCarry: '',
   };
 }
 
@@ -1618,10 +2846,117 @@ function emitMessageDelta(
   });
 }
 
+function getTrailingPrefixLength(text: string, token: string): number {
+  const max = Math.min(token.length - 1, text.length);
+  for (let len = max; len > 0; len -= 1) {
+    if (token.startsWith(text.slice(-len))) {
+      return len;
+    }
+  }
+  return 0;
+}
+
+function splitTextByThinkTags(
+  state: ThinkTagParserState,
+  input: string
+): Array<{ type: 'text' | 'thinking'; value: string }> {
+  if (!input) {
+    return [];
+  }
+
+  const OPEN_TAG = '<think>';
+  const CLOSE_TAG = '</think>';
+
+  const output: Array<{ type: 'text' | 'thinking'; value: string }> = [];
+  let source = `${state.thinkTagCarry}${input}`;
+  state.thinkTagCarry = '';
+
+  while (source.length > 0) {
+    if (state.inThinkTag) {
+      const closeIndex = source.indexOf(CLOSE_TAG);
+      if (closeIndex < 0) {
+        const carryLen = getTrailingPrefixLength(source, CLOSE_TAG);
+        const chunk = source.slice(0, source.length - carryLen);
+        if (chunk) {
+          output.push({ type: 'thinking', value: chunk });
+        }
+        state.thinkTagCarry = source.slice(source.length - carryLen);
+        break;
+      }
+
+      const thinkingText = source.slice(0, closeIndex);
+      if (thinkingText) {
+        output.push({ type: 'thinking', value: thinkingText });
+      }
+      source = source.slice(closeIndex + CLOSE_TAG.length);
+      state.inThinkTag = false;
+      continue;
+    }
+
+    const openIndex = source.indexOf(OPEN_TAG);
+    if (openIndex < 0) {
+      const carryLen = getTrailingPrefixLength(source, OPEN_TAG);
+      const chunk = source.slice(0, source.length - carryLen);
+      if (chunk) {
+        output.push({ type: 'text', value: chunk });
+      }
+      state.thinkTagCarry = source.slice(source.length - carryLen);
+      break;
+    }
+
+    const textPart = source.slice(0, openIndex);
+    if (textPart) {
+      output.push({ type: 'text', value: textPart });
+    }
+    source = source.slice(openIndex + OPEN_TAG.length);
+    state.inThinkTag = true;
+  }
+
+  return output;
+}
+
+function flushThinkTagCarryIfNeeded(
+  res: http.ServerResponse,
+  state: StreamState,
+  parseThinkTags: boolean
+): void {
+  if (!parseThinkTags || !state.thinkTagCarry) {
+    return;
+  }
+
+  const tail = state.thinkTagCarry;
+  state.thinkTagCarry = '';
+
+  if (state.inThinkTag) {
+    ensureThinkingBlock(res, state);
+    emitSSE(res, 'content_block_delta', {
+      type: 'content_block_delta',
+      index: state.contentIndex,
+      delta: {
+        type: 'thinking_delta',
+        thinking: tail,
+      },
+    });
+    state.inThinkTag = false;
+    return;
+  }
+
+  ensureTextBlock(res, state);
+  emitSSE(res, 'content_block_delta', {
+    type: 'content_block_delta',
+    index: state.contentIndex,
+    delta: {
+      type: 'text_delta',
+      text: tail,
+    },
+  });
+}
+
 function processOpenAIChunk(
   res: http.ServerResponse,
   state: StreamState,
-  chunk: OpenAIStreamChunk
+  chunk: OpenAIStreamChunk,
+  parseThinkTags: boolean
 ): void {
   ensureMessageStart(res, state, chunk);
 
@@ -1646,15 +2981,43 @@ function processOpenAIChunk(
   }
 
   if (delta?.content) {
-    ensureTextBlock(res, state);
-    emitSSE(res, 'content_block_delta', {
-      type: 'content_block_delta',
-      index: state.contentIndex,
-      delta: {
-        type: 'text_delta',
-        text: delta.content,
-      },
-    });
+    if (parseThinkTags) {
+      const segments = splitTextByThinkTags(state, delta.content);
+      for (const segment of segments) {
+        if (segment.type === 'thinking') {
+          ensureThinkingBlock(res, state);
+          emitSSE(res, 'content_block_delta', {
+            type: 'content_block_delta',
+            index: state.contentIndex,
+            delta: {
+              type: 'thinking_delta',
+              thinking: segment.value,
+            },
+          });
+          continue;
+        }
+
+        ensureTextBlock(res, state);
+        emitSSE(res, 'content_block_delta', {
+          type: 'content_block_delta',
+          index: state.contentIndex,
+          delta: {
+            type: 'text_delta',
+            text: segment.value,
+          },
+        });
+      }
+    } else {
+      ensureTextBlock(res, state);
+      emitSSE(res, 'content_block_delta', {
+        type: 'content_block_delta',
+        index: state.contentIndex,
+        delta: {
+          type: 'text_delta',
+          text: delta.content,
+        },
+      });
+    }
   }
 
   if (Array.isArray(delta?.tool_calls)) {
@@ -1704,7 +3067,8 @@ function processOpenAIChunk(
 
 async function handleStreamResponse(
   upstreamResponse: Response,
-  res: http.ServerResponse
+  res: http.ServerResponse,
+  parseThinkTags: boolean
 ): Promise<void> {
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
@@ -1729,6 +3093,7 @@ async function handleStreamResponse(
       return;
     }
     if (!state.hasMessageStop) {
+      flushThinkTagCarryIfNeeded(res, state, parseThinkTags);
       closeCurrentBlockIfNeeded(res, state);
       emitSSE(res, 'message_stop', {
         type: 'message_stop',
@@ -1773,7 +3138,7 @@ async function handleStreamResponse(
 
       try {
         const parsed = JSON.parse(payload) as OpenAIStreamChunk;
-        processOpenAIChunk(res, state, parsed);
+        processOpenAIChunk(res, state, parsed, parseThinkTags);
       } catch {
         // Ignore malformed stream chunks.
       }
@@ -1996,11 +3361,17 @@ async function handleRequest(
   if (!openAIRequest.model) {
     openAIRequest.model = upstreamConfig.model;
   }
-  const upstreamKind =
+  const isAntigravityProvider = upstreamConfig.provider === 'antigravity';
+  const configuredUpstreamKind =
     upstreamConfig.upstreamKind
-    || (upstreamConfig.provider === 'antigravity' ? 'antigravity' : 'openai');
+    || (isAntigravityProvider ? 'antigravity' : 'openai');
+  const configuredEndpointMode =
+    upstreamConfig.endpointMode
+    || (isAntigravityProvider ? 'cloudcode-sse' : 'openai-chat');
+  const upstreamKind: 'openai' | 'antigravity' = configuredUpstreamKind;
+  const endpointMode: 'openai-chat' | 'cloudcode-sse' = configuredEndpointMode;
 
-  if (upstreamKind === 'antigravity') {
+  if (isAntigravityProvider) {
     const requestedModel = typeof openAIRequest.model === 'string'
       ? openAIRequest.model
       : upstreamConfig.providerModelId || upstreamConfig.model;
@@ -2008,10 +3379,19 @@ async function handleRequest(
   }
 
   hydrateOpenAIRequestToolCalls(openAIRequest);
+  const mergedSystemsBeforeSend = mergeSystemMessagesForProvider(openAIRequest, upstreamConfig.provider);
+  if (mergedSystemsBeforeSend.changed) {
+    console.info('[cowork-openai-compat-proxy] Merged system messages before first upstream request', {
+      provider: upstreamConfig.provider || 'unknown',
+      system_before: mergedSystemsBeforeSend.before,
+      system_after: mergedSystemsBeforeSend.after,
+      request: summarizeOpenAIRequestForLog(openAIRequest),
+    });
+  }
 
   const stream = Boolean(openAIRequest.stream);
 
-  if (upstreamKind === 'antigravity') {
+  if (upstreamKind === 'antigravity' && endpointMode !== 'cloudcode-sse') {
     try {
       await handleAntigravityRequestViaPiAi(openAIRequest, stream, res, upstreamConfig);
       lastProxyError = null;
@@ -2036,12 +3416,27 @@ async function handleRequest(
   };
 
   const authHeaders: Record<string, string> = {};
-  const applyUpstreamAuthHeaders = async (): Promise<void> => {
+  let antigravityProjectId = '';
+  const applyUpstreamAuthHeaders = async (forceRefresh = false): Promise<void> => {
     Object.keys(authHeaders).forEach((key) => delete authHeaders[key]);
+    antigravityProjectId = '';
 
-    if (upstreamConfig.apiKey) {
-      authHeaders.Authorization = `Bearer ${upstreamConfig.apiKey}`;
+    const resolvedRawApiKey = upstreamConfig.resolveAuthApiKey
+      ? await upstreamConfig.resolveAuthApiKey(forceRefresh)
+      : upstreamConfig.apiKey;
+    const normalizedApiKey = typeof resolvedRawApiKey === 'string' ? resolvedRawApiKey.trim() : '';
+    if (!normalizedApiKey) {
+      return;
     }
+
+    if (isAntigravityProvider) {
+      const parsedPayload = parseUpstreamApiKeyPayload(normalizedApiKey);
+      authHeaders.Authorization = `Bearer ${parsedPayload.token}`;
+      antigravityProjectId = parsedPayload.projectId;
+      return;
+    }
+
+    authHeaders.Authorization = `Bearer ${normalizedApiKey}`;
   };
 
   try {
@@ -2053,7 +3448,35 @@ async function handleRequest(
     return;
   }
 
-  const targetURLs = buildUpstreamTargetUrls(upstreamConfig.baseURL);
+  if (endpointMode === 'cloudcode-sse') {
+    try {
+      await handleCloudCodeAssistRequest(
+        openAIRequest,
+        stream,
+        res,
+        upstreamConfig,
+        authHeaders,
+        applyUpstreamAuthHeaders,
+        () => antigravityProjectId
+      );
+      lastProxyError = null;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Cloud Code Assist request failed';
+      lastProxyError = message;
+      const statusCode = isRetryableAuthError(message) ? 401 : 502;
+      writeJSON(
+        res,
+        statusCode,
+        createAnthropicErrorBody(
+          message,
+          statusCode === 401 ? 'authentication_error' : 'api_error'
+        )
+      );
+    }
+    return;
+  }
+
+  const targetURLs = buildUpstreamTargetUrls(upstreamConfig.baseURL, endpointMode);
   let currentTargetURL = targetURLs[0];
 
   const sendUpstreamRequest = async (
@@ -2081,6 +3504,22 @@ async function handleRequest(
     return;
   }
 
+  if (
+    !upstreamResponse.ok
+    && (upstreamResponse.status === 401 || upstreamResponse.status === 403)
+    && upstreamConfig.resolveAuthApiKey
+  ) {
+    try {
+      await applyUpstreamAuthHeaders(true);
+      upstreamResponse = await sendUpstreamRequest(openAIRequest, currentTargetURL);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Failed to refresh upstream auth';
+      lastProxyError = message;
+      writeJSON(res, 401, createAnthropicErrorBody(message, 'authentication_error'));
+      return;
+    }
+  }
+
   if (!upstreamResponse.ok) {
     if (upstreamResponse.status === 404 && targetURLs.length > 1) {
       for (let i = 1; i < targetURLs.length; i += 1) {
@@ -2106,29 +3545,62 @@ async function handleRequest(
         firstErrorMessage = `Upstream API request failed (${upstreamResponse.status}) ${currentTargetURL}`;
       }
 
-    // Some OpenAI-compatible providers (e.g. DeepSeek) enforce strict max_tokens ranges.
-    // Retry once with a clamped value when the upstream response includes the allowed range.
-    if (upstreamResponse.status === 400) {
-      const clampResult = clampMaxTokensFromError(openAIRequest, firstErrorMessage);
-      if (clampResult.changed) {
-        try {
-          upstreamResponse = await sendUpstreamRequest(openAIRequest, currentTargetURL);
-          if (!upstreamResponse.ok) {
-            const retryErrorText = await upstreamResponse.text();
-            firstErrorMessage = extractErrorMessage(retryErrorText);
-          } else {
-            console.info(
-              `[cowork-openai-compat-proxy] Retried request with clamped max_tokens=${clampResult.clampedTo}`
-            );
+      // Some OpenAI-compatible providers enforce strict chat settings / schema constraints.
+      // Retry with compatible settings when we can derive safe adjustments.
+      if (upstreamResponse.status === 400) {
+        console.warn('[cowork-openai-compat-proxy] Upstream 400', {
+          provider: upstreamConfig?.provider || 'unknown',
+          upstreamBaseURL: upstreamConfig?.baseURL || '',
+          targetURL: currentTargetURL,
+          errorMessage: firstErrorMessage,
+          request: summarizeOpenAIRequestForLog(openAIRequest),
+        });
+
+        const clampResult = clampMaxTokensFromError(openAIRequest, firstErrorMessage);
+        if (clampResult.changed) {
+          try {
+            upstreamResponse = await sendUpstreamRequest(openAIRequest, currentTargetURL);
+            if (!upstreamResponse.ok) {
+              const retryErrorText = await upstreamResponse.text();
+              firstErrorMessage = extractErrorMessage(retryErrorText);
+            } else {
+              console.info(
+                `[cowork-openai-compat-proxy] Retried request with clamped max_tokens=${clampResult.clampedTo}`
+              );
+            }
+          } catch (error) {
+            const message = error instanceof Error ? error.message : 'Network error';
+            lastProxyError = message;
+            writeJSON(res, 502, createAnthropicErrorBody(message));
+            return;
           }
-        } catch (error) {
-          const message = error instanceof Error ? error.message : 'Network error';
-          lastProxyError = message;
-          writeJSON(res, 502, createAnthropicErrorBody(message));
-          return;
+        }
+
+        if (!upstreamResponse.ok && isLikelyInvalidChatSettingError(firstErrorMessage)) {
+          const retryChanges = applyStrictProviderRetryAdjustments(openAIRequest, upstreamConfig?.provider);
+          if (retryChanges.length > 0) {
+            try {
+              upstreamResponse = await sendUpstreamRequest(openAIRequest, currentTargetURL);
+              if (!upstreamResponse.ok) {
+                const retryErrorText = await upstreamResponse.text();
+                firstErrorMessage = extractErrorMessage(retryErrorText);
+              } else {
+                console.info('[cowork-openai-compat-proxy] Retried request with strict chat-setting fallback', {
+                  provider: upstreamConfig?.provider || 'unknown',
+                  targetURL: currentTargetURL,
+                  changes: retryChanges,
+                  request: summarizeOpenAIRequestForLog(openAIRequest),
+                });
+              }
+            } catch (error) {
+              const message = error instanceof Error ? error.message : 'Network error';
+              lastProxyError = message;
+              writeJSON(res, 502, createAnthropicErrorBody(message));
+              return;
+            }
+          }
         }
       }
-    }
 
     if (!upstreamResponse.ok) {
       lastProxyError = firstErrorMessage;
@@ -2141,7 +3613,8 @@ async function handleRequest(
   lastProxyError = null;
 
   if (stream) {
-    await handleStreamResponse(upstreamResponse, res);
+    const parseThinkTags = shouldMergeSystemMessages(upstreamConfig?.provider);
+    await handleStreamResponse(upstreamResponse, res, parseThinkTags);
     return;
   }
 
@@ -2224,6 +3697,7 @@ export function configureCoworkOpenAICompatProxy(config: OpenAICompatUpstreamCon
     baseURL: config.baseURL.trim(),
     apiKey: config.apiKey?.trim(),
     upstreamKind: config.upstreamKind ?? 'openai',
+    endpointMode: config.endpointMode ?? 'openai-chat',
   };
   lastProxyError = null;
 }
@@ -2252,6 +3726,7 @@ export function getCoworkOpenAICompatProxyStatus(): OpenAICompatProxyStatus {
     upstreamBaseURL: upstreamConfig?.baseURL || null,
     upstreamModel: upstreamConfig?.model || null,
     upstreamKind: upstreamConfig?.upstreamKind || null,
+    endpointMode: upstreamConfig?.endpointMode || null,
     lastError: lastProxyError,
   };
 }

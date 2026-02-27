@@ -286,6 +286,43 @@ const getProviderDefaultBaseUrl = (
   }
   return defaults[apiFormat];
 };
+const antigravityConnectionProbeModelPreferences = [
+  'google-antigravity/gemini-3-flash',
+  'google-antigravity/gemini-3.1-pro-low',
+  'google-antigravity/claude-sonnet-4-6',
+  'google-antigravity/claude-opus-4-6-thinking',
+] as const;
+const isAntigravityConnectionProbeModelUnsupported = (modelId: string): boolean => {
+  const normalized = modelId.trim().toLowerCase();
+  const withoutPrefix = normalized.startsWith('google-antigravity/')
+    ? normalized.slice('google-antigravity/'.length)
+    : normalized;
+  return withoutPrefix.startsWith('chat_') || withoutPrefix.startsWith('tab_');
+};
+const pickConnectionProbeModel = (provider: ProviderType, providerConfig: ProviderConfig): Model | undefined => {
+  const models = providerConfig.models ?? [];
+  if (models.length === 0) {
+    return undefined;
+  }
+  if (provider !== 'antigravity') {
+    return models[0];
+  }
+
+  const modelById = new Map(
+    models
+      .filter((model) => typeof model.id === 'string' && model.id.trim().length > 0)
+      .map((model) => [model.id.trim().toLowerCase(), model] as const)
+  );
+  for (const preferredId of antigravityConnectionProbeModelPreferences) {
+    const preferred = modelById.get(preferredId);
+    if (preferred) {
+      return preferred;
+    }
+  }
+
+  const firstUsableModel = models.find((model) => !isAntigravityConnectionProbeModelUnsupported(model.id || ''));
+  return firstUsableModel || models[0];
+};
 const shouldAutoSwitchProviderBaseUrl = (provider: ProviderType, currentBaseUrl: string): boolean => {
   const defaults = providerSwitchableDefaultBaseUrls[provider];
   if (!defaults) {
@@ -361,9 +398,7 @@ const extractConnectionErrorMessage = (
         ? directMessage
         : '';
 
-    if (message.includes('Cloud Code Private API has not been used')
-      || message.includes('SERVICE_DISABLED')
-      || message.includes('PERMISSION_DENIED')) {
+    if (message.includes('Cloud Code Private API has not been used')) {
       if (provider === 'antigravity') {
         return withContext(`${i18nService.t('antigravityApiDisabledHint')} (project: ${projectId || 'unknown'})`);
       }
@@ -1387,9 +1422,9 @@ const Settings: React.FC<SettingsProps> = ({ onClose, initialTab, notice }) => {
       return;
     }
 
-    // 获取第一个可用模型
-    const firstModel = providerConfig.models?.[0];
-    if (!firstModel) {
+    // 获取可用于探活的模型（antigravity 优先稳定模型，避免命中 chat_/tab_ 等非对话模型）
+    const probeModel = pickConnectionProbeModel(activeProvider, providerConfig);
+    if (!probeModel) {
       setTestResult({ success: false, message: i18nService.t('noModelsConfigured') });
       setIsTesting(false);
       return;
@@ -1398,10 +1433,10 @@ const Settings: React.FC<SettingsProps> = ({ onClose, initialTab, notice }) => {
     try {
       let response: Awaited<ReturnType<typeof window.electron.api.fetch>>;
       let effectiveConfig: ProviderConfig = providerConfig;
-      let modelId = firstModel.id;
+      let modelId = probeModel.id;
 
       if (activeProvider === 'antigravity') {
-        const resolved = await window.electron.oauth.resolveApiConfig('antigravity', firstModel.id);
+        const resolved = await window.electron.oauth.resolveApiConfig('antigravity', probeModel.id);
         if (!resolved.success || !resolved.config) {
           throw new Error(resolved.error || i18nService.t('oauthConnectionRequired'));
         }

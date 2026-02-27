@@ -590,7 +590,8 @@ export class OAuthService {
         model: normalizeAntigravityModelId(normalizedProviderModel),
         providerModelId: normalizedProviderModel,
         provider: ANTIGRAVITY_PROVIDER_KEY,
-        upstreamKind: 'antigravity',
+        upstreamKind: 'openai',
+        endpointMode: 'cloudcode-sse',
         resolveAuthApiKey: async (forceRefresh?: boolean) => {
           const resolved = await this.resolveApiKey(providerKey, forceRefresh ?? false);
           return resolved.apiKey;
@@ -606,7 +607,7 @@ export class OAuthService {
         apiKey: 'lobsterai-antigravity-oauth',
         baseURL: proxyBaseURL,
         model: normalizedProviderModel,
-        apiType: 'anthropic',
+        apiType: 'openai',
       };
     }
 

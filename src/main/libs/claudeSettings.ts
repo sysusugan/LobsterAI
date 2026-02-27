@@ -213,7 +213,8 @@ export function resolveCurrentApiConfig(): ApiConfigResolution {
       model: normalizeAntigravityModel(matched.modelId),
       providerModelId: matched.modelId,
       provider: matched.providerName,
-      upstreamKind: 'antigravity',
+      upstreamKind: 'openai',
+      endpointMode: 'cloudcode-sse',
       resolveAuthApiKey: async (forceRefresh?: boolean) => antigravityAuthResolver?.(forceRefresh ?? false),
     });
 

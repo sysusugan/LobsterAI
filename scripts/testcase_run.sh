@@ -66,12 +66,20 @@ if [[ "$FAILED" -ne 0 ]]; then
   exit 1
 fi
 
-ELECTRON_TESTCASE="scripts/testcases/testcase_04_chat_cowork_flow.mjs"
-echo "[testcase_run] RUN $ELECTRON_TESTCASE (electron runtime)"
-if ! ./node_modules/.bin/electron "$ELECTRON_TESTCASE"; then
-  echo "[testcase_run] FAIL $ELECTRON_TESTCASE"
-  exit 1
-fi
-echo "[testcase_run] PASS $ELECTRON_TESTCASE"
+ELECTRON_TESTCASES=(
+  "scripts/testcases/testcase_04_chat_cowork_flow.mjs"
+  "scripts/testcases/testcase_05_proxy_stream.mjs"
+  "scripts/testcases/testcase_06_proxy_models.mjs"
+  "scripts/testcases/testcase_07_proxy_cloudcode_think_fallback.mjs"
+)
+
+for testcase in "${ELECTRON_TESTCASES[@]}"; do
+  echo "[testcase_run] RUN $testcase (electron runtime)"
+  if ! ./node_modules/.bin/electron "$testcase"; then
+    echo "[testcase_run] FAIL $testcase"
+    exit 1
+  fi
+  echo "[testcase_run] PASS $testcase"
+done
 
 echo "[testcase_run] ALL PASS"
