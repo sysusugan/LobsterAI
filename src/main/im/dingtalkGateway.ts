@@ -13,11 +13,14 @@ import {
   DingTalkMediaMessage,
   MediaMarker,
   IMMessage,
+  IMMediaAttachment,
   DEFAULT_DINGTALK_STATUS,
 } from './types';
 import { uploadMediaToDingTalk, detectMediaType, getOapiAccessToken } from './dingtalkMedia';
+import { downloadDingtalkFile, getDefaultMimeType, mapDingtalkMediaType } from './dingtalkMediaDownload';
 import { parseMediaMarkers } from './dingtalkMediaParser';
 import { createUtf8JsonBody, JSON_UTF8_CONTENT_TYPE, stringifyAsciiJson } from './jsonEncoding';
+import { sanitizeLogArg, sanitizeLogArgs } from './logSanitizer';
 
 const DINGTALK_API = 'https://api.dingtalk.com';
 
@@ -31,6 +34,8 @@ interface MessageContent {
   messageType: string;
   mediaPath?: string;
   mediaType?: string;
+  fileName?: string;
+  duration?: string;
 }
 
 export class DingTalkGateway extends EventEmitter {
@@ -58,6 +63,16 @@ export class DingTalkGateway extends EventEmitter {
 
   constructor() {
     super();
+  }
+
+  private patchSdkDebugLogger(client: any): void {
+    if (!client || typeof client.printDebug !== 'function') {
+      return;
+    }
+    const rawPrintDebug = client.printDebug.bind(client);
+    client.printDebug = (message: unknown) => {
+      rawPrintDebug(sanitizeLogArg(message));
+    };
   }
 
   /**
@@ -250,7 +265,9 @@ export class DingTalkGateway extends EventEmitter {
     this.config = config;
     this.savedConfig = { ...config }; // Save config for reconnection
     this.isStopping = false;
-    this.log = config.debug ? console.log.bind(console) : () => {};
+    this.log = config.debug ? (...args: unknown[]) => {
+      console.log(...sanitizeLogArgs(args));
+    } : () => {};
     this.log('[DingTalk Gateway] Starting...');
 
     try {
@@ -263,6 +280,9 @@ export class DingTalkGateway extends EventEmitter {
         debug: config.debug || false,
         keepAlive: true,
       });
+      if (config.debug) {
+        this.patchSdkDebugLogger(this.client);
+      }
 
       // Register message callback
       this.client.registerCallbackListener(TOPIC_ROBOT, async (res: any) => {
@@ -425,6 +445,35 @@ export class DingTalkGateway extends EventEmitter {
         mediaPath: data.content?.downloadCode,
         mediaType: 'audio',
         messageType: 'audio',
+      };
+    }
+
+    if (msgtype === 'picture') {
+      return {
+        text: '[图片]',
+        mediaPath: data.content?.downloadCode,
+        mediaType: 'image',
+        messageType: 'picture',
+      };
+    }
+
+    if (msgtype === 'video') {
+      return {
+        text: '[视频]',
+        mediaPath: data.content?.downloadCode,
+        mediaType: 'video',
+        messageType: 'video',
+        duration: data.content?.duration,
+      };
+    }
+
+    if (msgtype === 'file') {
+      return {
+        text: '[文件]',
+        mediaPath: data.content?.downloadCode,
+        mediaType: 'file',
+        fileName: data.content?.fileName,
+        messageType: 'file',
       };
     }
 
@@ -661,7 +710,7 @@ export class DingTalkGateway extends EventEmitter {
     }
 
     const content = this.extractMessageContent(data);
-    if (!content.text) {
+    if (!content.text && !content.mediaPath) {
       return;
     }
 
@@ -681,6 +730,34 @@ export class DingTalkGateway extends EventEmitter {
       mediaType: content.mediaType,
     }, null, 2));
 
+    // Download media attachments if present
+    let attachments: IMMediaAttachment[] | undefined;
+    if (content.mediaPath && content.mediaType && this.config) {
+      try {
+        const token = await this.getAccessToken();
+        const robotCode = this.config.robotCode || this.config.clientId;
+        const result = await downloadDingtalkFile(
+          token,
+          content.mediaPath,
+          robotCode,
+          content.mediaType,
+          content.fileName
+        );
+        if (result) {
+          attachments = [{
+            type: mapDingtalkMediaType(content.mediaType),
+            localPath: result.localPath,
+            mimeType: getDefaultMimeType(content.mediaType),
+            fileName: content.fileName,
+            fileSize: result.fileSize,
+            duration: content.duration ? parseInt(content.duration, 10) / 1000 : undefined,
+          }];
+        }
+      } catch (err: any) {
+        console.error(`[DingTalk] 下载媒体失败: ${err.message}`);
+      }
+    }
+
     // Create IMMessage
     const message: IMMessage = {
       platform: 'dingtalk',
@@ -691,6 +768,7 @@ export class DingTalkGateway extends EventEmitter {
       content: content.text,
       chatType: isDirect ? 'direct' : 'group',
       timestamp: data.createAt || Date.now(),
+      attachments,
     };
     this.status.lastInboundAt = Date.now();
 
@@ -735,6 +813,20 @@ export class DingTalkGateway extends EventEmitter {
   }
 
   /**
+   * Get the current notification target for persistence.
+   */
+  getNotificationTarget(): { conversationType: '1' | '2'; userId?: string; openConversationId?: string; sessionWebhook: string } | null {
+    return this.lastConversation;
+  }
+
+  /**
+   * Restore notification target from persisted state.
+   */
+  setNotificationTarget(target: { conversationType: '1' | '2'; userId?: string; openConversationId?: string; sessionWebhook: string }): void {
+    this.lastConversation = target;
+  }
+
+  /**
    * Send a notification message to the last known conversation.
    */
   async sendNotification(text: string): Promise<void> {
@@ -742,6 +834,21 @@ export class DingTalkGateway extends EventEmitter {
       throw new Error('No conversation available for notification');
     }
     await this.sendBySession(this.lastConversation.sessionWebhook, text);
+    this.status.lastOutboundAt = Date.now();
+  }
+
+  /**
+   * Send a notification message with media support to the last known conversation.
+   */
+  async sendNotificationWithMedia(text: string): Promise<void> {
+    if (!this.lastConversation) {
+      throw new Error('No conversation available for notification');
+    }
+    await this.sendWithMedia(this.lastConversation.sessionWebhook, text, {
+      conversationType: this.lastConversation.conversationType,
+      userId: this.lastConversation.userId,
+      openConversationId: this.lastConversation.openConversationId,
+    });
     this.status.lastOutboundAt = Date.now();
   }
 }

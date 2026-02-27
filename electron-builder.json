@@ -19,7 +19,9 @@
       "filter": [
         "**/*",
         "!**/.env",
-        "!**/.env.*"
+        "!**/.env.*",
+        "!**/.venv",
+        "!**/.venv/**"
       ]
     },
     {
@@ -83,7 +85,8 @@
     "node_modules/@anthropic-ai/claude-agent-sdk/**",
     "node_modules/@mariozechner/pi-ai/**",
     "node_modules/@img/**",
-    "node_modules/sql.js/dist/**"
+    "node_modules/sql.js/dist/**",
+    "node_modules/node-nim/**"
   ],
   "asar": true
 }

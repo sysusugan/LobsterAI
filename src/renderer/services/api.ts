@@ -2,6 +2,18 @@ import { store } from '../store';
 import { configService } from './config';
 import { ChatMessagePayload, ChatUserMessageInput, ImageAttachment } from '../types/chat';
 
+const ZHIPU_CODING_PLAN_OPENAI_BASE_URL = 'https://open.bigmodel.cn/api/coding/paas/v4';
+const ZHIPU_CODING_PLAN_ANTHROPIC_BASE_URL = 'https://open.bigmodel.cn/api/anthropic';
+// Qwen Coding Plan 专属端点 (OpenAI 兼容和 Anthropic 兼容)
+const QWEN_CODING_PLAN_OPENAI_BASE_URL = 'https://coding.dashscope.aliyuncs.com/v1';
+const QWEN_CODING_PLAN_ANTHROPIC_BASE_URL = 'https://coding.dashscope.aliyuncs.com/apps/anthropic';
+// Volcengine Coding Plan 专属端点 (OpenAI 兼容和 Anthropic 兼容)
+const VOLCENGINE_CODING_PLAN_OPENAI_BASE_URL = 'https://ark.cn-beijing.volces.com/api/coding/v3';
+const VOLCENGINE_CODING_PLAN_ANTHROPIC_BASE_URL = 'https://ark.cn-beijing.volces.com/api/coding';
+// Moonshot Coding Plan 专属端点 (OpenAI 兼容和 Anthropic 兼容)
+const MOONSHOT_CODING_PLAN_OPENAI_BASE_URL = 'https://api.kimi.com/coding/v1';
+const MOONSHOT_CODING_PLAN_ANTHROPIC_BASE_URL = 'https://api.kimi.com/coding';
+
 export interface ApiConfig {
   apiKey: string;
   baseUrl: string;
@@ -79,10 +91,29 @@ class ApiService {
       return `${normalized}/v1beta/openai/chat/completions`;
     }
 
-    if (normalized.endsWith('/v1')) {
+    // Handle /v1, /v4 etc. versioned paths
+    if (/\/v\d+$/.test(normalized)) {
       return `${normalized}/chat/completions`;
     }
     return `${normalized}/v1/chat/completions`;
+  }
+
+  private buildOpenAIResponsesUrl(baseUrl: string): string {
+    const normalized = baseUrl.trim().replace(/\/+$/, '');
+    if (!normalized) {
+      return '/v1/responses';
+    }
+    if (normalized.endsWith('/responses')) {
+      return normalized;
+    }
+    if (normalized.endsWith('/v1')) {
+      return `${normalized}/responses`;
+    }
+    return `${normalized}/v1/responses`;
+  }
+
+  private shouldUseOpenAIResponsesApi(provider: string): boolean {
+    return provider === 'openai';
   }
 
   private buildImageHint(images?: ImageAttachment[]): string {
@@ -134,6 +165,72 @@ class ApiService {
     return { role: message.role, content };
   }
 
+  private formatOpenAIResponsesInputMessage(message: ChatMessagePayload, supportsImages: boolean) {
+    const role = message.role === 'assistant' ? 'assistant' : 'user';
+
+    if (role === 'user' && supportsImages && message.images?.length) {
+      const parts: Array<
+        | { type: 'input_text'; text: string }
+        | { type: 'input_image'; image_url: string }
+      > = [];
+      if (message.content?.trim()) {
+        parts.push({ type: 'input_text', text: message.content });
+      }
+      message.images.forEach(image => {
+        if (image.dataUrl) {
+          parts.push({ type: 'input_image', image_url: image.dataUrl });
+        }
+      });
+      if (!parts.length) return null;
+      return { role, content: parts };
+    }
+
+    const content = supportsImages
+      ? message.content
+      : this.mergeContentWithImageHint(message.content, message.images);
+    if (!content?.trim()) return null;
+    if (role === 'assistant') {
+      return { role, content: [{ type: 'output_text', text: content }] };
+    }
+    return { role, content: [{ type: 'input_text', text: content }] };
+  }
+
+  private extractResponsesOutputText(payload: any): string {
+    const directOutputText = typeof payload?.output_text === 'string' ? payload.output_text : '';
+    if (directOutputText) {
+      return directOutputText;
+    }
+
+    const nestedOutputText = typeof payload?.response?.output_text === 'string'
+      ? payload.response.output_text
+      : '';
+    if (nestedOutputText) {
+      return nestedOutputText;
+    }
+
+    const output = Array.isArray(payload?.response?.output)
+      ? payload.response.output
+      : Array.isArray(payload?.output)
+        ? payload.output
+        : [];
+    if (!Array.isArray(output)) {
+      return '';
+    }
+
+    const chunks: string[] = [];
+    output.forEach((item: any) => {
+      if (!Array.isArray(item?.content)) {
+        return;
+      }
+      item.content.forEach((contentItem: any) => {
+        if (typeof contentItem?.text === 'string' && contentItem.text) {
+          chunks.push(contentItem.text);
+        }
+      });
+    });
+    return chunks.join('');
+  }
+
   private formatAnthropicMessage(message: ChatMessagePayload, supportsImages: boolean) {
     if (message.role === 'system') return null;
     if (supportsImages && message.images?.length) {
@@ -177,7 +274,7 @@ class ApiService {
     const normalizedHint = providerHint?.toLowerCase();
     if (
       normalizedHint
-      && ['openai', 'deepseek', 'moonshot', 'zhipu', 'minimax', 'qwen', 'openrouter', 'gemini', 'anthropic', 'antigravity', 'ollama'].includes(normalizedHint)
+      && ['openai', 'deepseek', 'moonshot', 'zhipu', 'minimax', 'qwen', 'openrouter', 'gemini', 'anthropic', 'antigravity', 'xiaomi', 'volcengine', 'ollama'].includes(normalizedHint)
     ) {
       return normalizedHint;
     }
@@ -201,6 +298,10 @@ class ApiService {
       return 'minimax';
     } else if (normalizedModelId.startsWith('qwen') || normalizedModelId.startsWith('qvq')) {
       return 'qwen';
+    } else if (normalizedModelId.startsWith('mimo') || normalizedModelId.includes('xiaomi')) {
+      return 'xiaomi';
+    } else if (normalizedModelId.startsWith('doubao') || normalizedModelId.includes('volcengine') || normalizedModelId.includes('ep-') || normalizedModelId.startsWith('ark-')) {
+      return 'volcengine';
     }
     return 'openai'; // 默认使用 OpenAI 兼容格式
   }
@@ -212,11 +313,58 @@ class ApiService {
     if (appConfig?.providers?.[provider]) {
       const providerConfig = appConfig.providers[provider];
       if (providerConfig.enabled && (providerConfig.apiKey || !this.providerRequiresApiKey(provider))) {
+        let baseUrl = providerConfig.baseUrl;
+        let apiFormat = this.normalizeApiFormat(providerConfig.apiFormat);
+        
+        // Handle Zhipu GLM Coding Plan endpoint switch
+        // Coding Plan supports both OpenAI and Anthropic compatible formats
+        if (provider === 'zhipu' && providerConfig.codingPlanEnabled) {
+          if (apiFormat === 'anthropic') {
+            baseUrl = ZHIPU_CODING_PLAN_ANTHROPIC_BASE_URL;
+          } else {
+            baseUrl = ZHIPU_CODING_PLAN_OPENAI_BASE_URL;
+            apiFormat = 'openai';
+          }
+        }
+
+        // Handle Qwen Coding Plan endpoint switch
+        // Coding Plan supports both OpenAI and Anthropic compatible formats
+        if (provider === 'qwen' && providerConfig.codingPlanEnabled) {
+          if (apiFormat === 'anthropic') {
+            baseUrl = QWEN_CODING_PLAN_ANTHROPIC_BASE_URL;
+          } else {
+            baseUrl = QWEN_CODING_PLAN_OPENAI_BASE_URL;
+            apiFormat = 'openai';
+          }
+        }
+
+        // Handle Volcengine Coding Plan endpoint switch
+        // Coding Plan supports both OpenAI and Anthropic compatible formats
+        if (provider === 'volcengine' && providerConfig.codingPlanEnabled) {
+          if (apiFormat === 'anthropic') {
+            baseUrl = VOLCENGINE_CODING_PLAN_ANTHROPIC_BASE_URL;
+          } else {
+            baseUrl = VOLCENGINE_CODING_PLAN_OPENAI_BASE_URL;
+            apiFormat = 'openai';
+          }
+        }
+
+        // Handle Moonshot Coding Plan endpoint switch
+        // Coding Plan supports both OpenAI and Anthropic compatible formats
+        if (provider === 'moonshot' && providerConfig.codingPlanEnabled) {
+          if (apiFormat === 'anthropic') {
+            baseUrl = MOONSHOT_CODING_PLAN_ANTHROPIC_BASE_URL;
+          } else {
+            baseUrl = MOONSHOT_CODING_PLAN_OPENAI_BASE_URL;
+            apiFormat = 'openai';
+          }
+        }
+        
         return {
           apiKey: providerConfig.apiKey,
-          baseUrl: providerConfig.baseUrl,
+          baseUrl,
           provider: provider,
-          apiFormat: this.normalizeApiFormat(providerConfig.apiFormat),
+          apiFormat,
         };
       }
     }
@@ -290,7 +438,7 @@ class ApiService {
 
     // 根据 API 协议格式决定调用方式：
     // - anthropic: Anthropic 兼容协议 (/v1/messages)
-    // - openai: OpenAI 兼容协议 (/v1/chat/completions)
+    // - openai: OpenAI 兼容协议 (OpenAI provider uses /v1/responses)
     const normalizedApiFormat = this.normalizeApiFormat(effectiveConfig.apiFormat);
     const useOpenAIFormat = normalizedApiFormat === 'openai';
 
@@ -482,6 +630,7 @@ class ApiService {
       this.cancelOngoingRequest();
       const requestId = generateRequestId();
       this.currentRequestId = requestId;
+      const useResponsesApi = this.shouldUseOpenAIResponsesApi(provider);
 
       const userMessage: ChatMessagePayload = {
         role: 'user',
@@ -494,31 +643,69 @@ class ApiService {
       ]
         .map(item => this.formatOpenAIMessage(item, supportsImages))
         .filter(Boolean);
+      const systemInstructions = history
+        .filter(item => item.role === 'system')
+        .map(item => this.mergeContentWithImageHint(item.content, supportsImages ? undefined : item.images))
+        .filter(Boolean)
+        .join('\n');
+      const responseInputMessages = [
+        ...history.filter(item => item.role !== 'system'),
+        userMessage,
+      ]
+        .map(item => this.formatOpenAIResponsesInputMessage(item, supportsImages))
+        .filter(Boolean);
 
       return new Promise((resolve, reject) => {
         let aborted = false;
+        let sseBuffer = '';
+        let currentEvent = '';
 
         // 设置流式监听器
         const removeDataListener = window.electron.api.onStreamData(requestId, (chunk) => {
-          const lines = chunk.split('\n');
+          sseBuffer += chunk;
+          const lines = sseBuffer.split('\n');
+          sseBuffer = lines.pop() ?? '';
 
-          for (const line of lines) {
-            console.log('>>>>>', line);
-            if (line.startsWith('data: ')) {
-              const data = line.slice(6);
-              if (data === '[DONE]') continue;
+          for (const rawLine of lines) {
+            const line = rawLine.replace(/\r$/, '');
+            if (!line) {
+              currentEvent = '';
+              continue;
+            }
+            if (line.startsWith('event: ')) {
+              currentEvent = line.slice(7).trim();
+              continue;
+            }
+            if (!line.startsWith('data: ')) {
+              continue;
+            }
 
-              try {
-                const parsed = JSON.parse(data);
-                const delta = parsed.choices?.[0]?.delta || {};
-                const content = typeof delta.content === 'string' ? delta.content : '';
-                const reasoning = typeof delta.reasoning_content === 'string'
-                  ? delta.reasoning_content
-                  : typeof delta.reasoning === 'string'
-                    ? delta.reasoning
-                    : typeof delta.thoughts === 'string'
-                      ? delta.thoughts
-                      : '';
+            const data = line.slice(6);
+            if (data === '[DONE]') continue;
+
+            try {
+              const parsed = JSON.parse(data);
+
+              if (useResponsesApi) {
+                const eventType = currentEvent || String(parsed.type || '');
+                const content = (
+                  (eventType === 'response.output_text.delta' || eventType === 'response.output.delta')
+                  && typeof parsed.delta === 'string'
+                )
+                  ? parsed.delta
+                  : '';
+                const reasoning = (
+                  eventType === 'response.reasoning_summary_text.delta'
+                  && typeof parsed.delta === 'string'
+                )
+                  ? parsed.delta
+                  : '';
+                const completedText = (
+                  eventType === 'response.completed'
+                  || eventType === 'response.output_item.done'
+                )
+                  ? this.extractResponsesOutputText(parsed)
+                  : '';
 
                 if (content) {
                   fullContent += content;
@@ -526,12 +713,36 @@ class ApiService {
                 if (reasoning) {
                   fullReasoning += reasoning;
                 }
-                if (content || reasoning) {
+                if (!fullContent && completedText) {
+                  fullContent = completedText;
+                }
+                if (content || reasoning || completedText) {
                   onProgress?.(fullContent, fullReasoning || undefined);
                 }
-              } catch (e) {
-                console.warn('Failed to parse SSE message:', e);
+                continue;
               }
+
+              const delta = parsed.choices?.[0]?.delta || {};
+              const content = typeof delta.content === 'string' ? delta.content : '';
+              const reasoning = typeof delta.reasoning_content === 'string'
+                ? delta.reasoning_content
+                : typeof delta.reasoning === 'string'
+                  ? delta.reasoning
+                  : typeof delta.thoughts === 'string'
+                    ? delta.thoughts
+                    : '';
+
+              if (content) {
+                fullContent += content;
+              }
+              if (reasoning) {
+                fullReasoning += reasoning;
+              }
+              if (content || reasoning) {
+                onProgress?.(fullContent, fullReasoning || undefined);
+              }
+            } catch (e) {
+              console.warn('Failed to parse SSE message:', e);
             }
           }
         });
@@ -565,18 +776,29 @@ class ApiService {
           headers.Authorization = `Bearer ${config.apiKey}`;
         }
 
-        // 发起流式请求
-        const chatCompletionsUrl = this.buildOpenAICompatibleChatCompletionsUrl(config.baseUrl, provider);
+        const requestUrl = useResponsesApi
+          ? this.buildOpenAIResponsesUrl(config.baseUrl)
+          : this.buildOpenAICompatibleChatCompletionsUrl(config.baseUrl, provider);
+        const requestBody: Record<string, unknown> = useResponsesApi
+          ? {
+              model: modelId,
+              input: responseInputMessages,
+              stream: true,
+            }
+          : {
+              model: modelId,
+              messages: messages,
+              stream: true,
+            };
+        if (useResponsesApi && systemInstructions) {
+          requestBody.instructions = systemInstructions;
+        }
 
         window.electron.api.stream({
-          url: chatCompletionsUrl,
+          url: requestUrl,
           method: 'POST',
           headers,
-          body: JSON.stringify({
-            model: modelId,
-            messages: messages,
-            stream: true,
-          }),
+          body: JSON.stringify(requestBody),
           requestId,
         }).then((response) => {
           if (!response.ok && !aborted) {
@@ -611,4 +833,4 @@ class ApiService {
   }
 }
 
-export const apiService = new ApiService(); 
+export const apiService = new ApiService();

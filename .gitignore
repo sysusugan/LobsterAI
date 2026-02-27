@@ -1,4 +1,7 @@
-build/
+build/*
+!build/entitlements.mac.plist
+!build/icons/
+!build/icons/**
 release/
 node_modules
 dist
@@ -23,6 +26,7 @@ resources/PortableGit-*.7z.exe
 SKILLs/**/.connection
 SKILLs/**/.server.log
 SKILLs/**/.server.pid
+SKILLs/**/.venv/
 
 package-lock.json
 

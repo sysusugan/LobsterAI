@@ -28,6 +28,8 @@ export type OpenAICompatUpstreamConfig = {
   resolveAuthApiKey?: (forceRefresh?: boolean) => Promise<string>;
 };
 
+export type OpenAICompatProxyTarget = 'local' | 'sandbox';
+
 export type OpenAICompatProxyStatus = {
   running: boolean;
   baseURL: string | null;
@@ -60,7 +62,9 @@ type StreamState = {
 
 type ThinkTagParserState = Pick<StreamState, 'inThinkTag' | 'thinkTagCarry'>;
 
+const PROXY_BIND_HOST = '0.0.0.0';
 const LOCAL_HOST = '127.0.0.1';
+const SANDBOX_HOST = '10.0.2.2';
 const DEFAULT_PI_MODEL_MAX_TOKENS = 65536;
 const DEFAULT_PI_MODEL_CONTEXT_WINDOW = 1048576;
 const DEFAULT_ANTIGRAVITY_REQUEST_TIMEOUT_MS = 120000;
@@ -3796,7 +3800,7 @@ export async function startCoworkOpenAICompatProxy(): Promise<void> {
       reject(error);
     });
 
-    server.listen(0, LOCAL_HOST, () => {
+    server.listen(0, PROXY_BIND_HOST, () => {
       const addr = server.address();
       if (!addr || typeof addr === 'string') {
         reject(new Error('Failed to bind OpenAI compatibility proxy port'));
@@ -3842,11 +3846,12 @@ export function configureCoworkOpenAICompatProxy(config: OpenAICompatUpstreamCon
   lastProxyError = null;
 }
 
-export function getCoworkOpenAICompatProxyBaseURL(): string | null {
+export function getCoworkOpenAICompatProxyBaseURL(target: OpenAICompatProxyTarget = 'local'): string | null {
   if (!proxyServer || !proxyPort) {
     return null;
   }
-  return `http://${LOCAL_HOST}:${proxyPort}`;
+  const host = target === 'sandbox' ? SANDBOX_HOST : LOCAL_HOST;
+  return `http://${host}:${proxyPort}`;
 }
 
 /**

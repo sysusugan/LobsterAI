@@ -16,7 +16,6 @@ interface MessageAccumulator {
   messages: CoworkMessage[];
   resolve: (text: string) => void;
   reject: (error: Error) => void;
-  timeoutId?: NodeJS.Timeout;
 }
 
 interface PendingIMPermission {
@@ -39,7 +38,6 @@ export interface IMCoworkHandlerOptions {
   coworkStore: CoworkStore;
   imStore: IMStore;
   getSkillsPrompt?: () => Promise<string | null>;
-  timeout?: number; // Timeout in ms, default 120000 (2 minutes)
 }
 
 export class IMCoworkHandler extends EventEmitter {
@@ -47,7 +45,6 @@ export class IMCoworkHandler extends EventEmitter {
   private coworkStore: CoworkStore;
   private imStore: IMStore;
   private getSkillsPrompt?: () => Promise<string | null>;
-  private timeout: number;
 
   // Track active sessions' message accumulation
   private messageAccumulators: Map<string, MessageAccumulator> = new Map();
@@ -63,7 +60,6 @@ export class IMCoworkHandler extends EventEmitter {
     this.coworkStore = options.coworkStore;
     this.imStore = options.imStore;
     this.getSkillsPrompt = options.getSkillsPrompt;
-    this.timeout = options.timeout ?? 120000;
 
     this.setupEventListeners();
   }
@@ -92,6 +88,12 @@ export class IMCoworkHandler extends EventEmitter {
       return await this.processMessageInternal(message, false);
     } catch (error) {
       if (!this.isSessionNotFoundError(error)) {
+        if (this.shouldRetryWithFreshSession(error, message)) {
+          console.warn(
+            `[IMCoworkHandler] Detected recoverable API 400 for ${message.platform}:${message.conversationId}, recreating session and retrying once`
+          );
+          return this.processMessageInternal(message, true);
+        }
         throw error;
       }
 
@@ -277,6 +279,34 @@ export class IMCoworkHandler extends EventEmitter {
     return /^Session\s.+\snot found$/i.test(message.trim());
   }
 
+  private isRecoverableApi400Error(error: unknown): boolean {
+    const message = (error instanceof Error ? error.message : String(error)).toLowerCase();
+    if (!message.includes('400')) {
+      return false;
+    }
+
+    return (
+      message.includes('api error')
+      || message.includes('bad_response_status_code')
+      || message.includes('invalid chat setting')
+      || message.includes('signature: field required')
+    );
+  }
+
+  private shouldRetryWithFreshSession(error: unknown, message: IMMessage): boolean {
+    if (!this.isRecoverableApi400Error(error)) {
+      return false;
+    }
+
+    const mapping = this.imStore.getSessionMapping(message.conversationId, message.platform);
+    if (!mapping) {
+      return false;
+    }
+
+    const session = this.coworkStore.getSession(mapping.coworkSessionId);
+    return Boolean(session?.claudeSessionId);
+  }
+
   /**
    * Handle message event from CoworkRunner
    */
@@ -315,29 +345,15 @@ export class IMCoworkHandler extends EventEmitter {
     return new Promise((resolve, reject) => {
       const existingAccumulator = this.messageAccumulators.get(sessionId);
       if (existingAccumulator) {
-        if (existingAccumulator.timeoutId) {
-          clearTimeout(existingAccumulator.timeoutId);
-        }
         this.messageAccumulators.delete(sessionId);
         existingAccumulator.reject(new Error('Replaced by a newer IM request'));
       }
-
-      // Set up timeout
-      const timeoutId = setTimeout(() => {
-        const accumulator = this.messageAccumulators.get(sessionId);
-        if (accumulator) {
-          this.messageAccumulators.delete(sessionId);
-          this.coworkRunner.stopSession(sessionId);
-          reject(new Error('Request timed out'));
-        }
-      }, this.timeout);
 
       // Set up message accumulator
       this.messageAccumulators.set(sessionId, {
         messages: [],
         resolve,
         reject,
-        timeoutId,
       });
     });
   }
@@ -559,13 +575,9 @@ export class IMCoworkHandler extends EventEmitter {
   }
 
   /**
-   * Clean up accumulator and timeout
+   * Clean up accumulator
    */
   private cleanupAccumulator(sessionId: string): void {
-    const accumulator = this.messageAccumulators.get(sessionId);
-    if (accumulator?.timeoutId) {
-      clearTimeout(accumulator.timeoutId);
-    }
     this.messageAccumulators.delete(sessionId);
   }
 
@@ -579,8 +591,8 @@ export class IMCoworkHandler extends EventEmitter {
       // Skip user messages (they're the input)
       if (msg.type === 'user') continue;
 
-      // Only include assistant messages in reply
-      if (msg.type === 'assistant' && msg.content) {
+      // Only include assistant messages in reply (skip thinking messages)
+      if (msg.type === 'assistant' && msg.content && !msg.metadata?.isThinking) {
         parts.push(msg.content);
       }
     }
@@ -620,9 +632,6 @@ export class IMCoworkHandler extends EventEmitter {
   destroy(): void {
     // Clear all pending accumulators
     for (const [_sessionId, accumulator] of this.messageAccumulators) {
-      if (accumulator.timeoutId) {
-        clearTimeout(accumulator.timeoutId);
-      }
       accumulator.reject(new Error('Handler destroyed'));
     }
     this.messageAccumulators.clear();

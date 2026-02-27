@@ -1,9 +1,83 @@
 import { app, BrowserWindow, session } from 'electron';
-import { spawn, spawnSync } from 'child_process';
+import { execSync, spawn, spawnSync } from 'child_process';
 import fs from 'fs';
 import path from 'path';
+import yaml from 'js-yaml';
 import extractZip from 'extract-zip';
 import { SqliteStore } from './sqliteStore';
+import { cpRecursiveSync } from './fsCompat';
+
+/**
+ * Resolve the user's login shell PATH on macOS/Linux.
+ * Packaged Electron apps on macOS don't inherit the user's shell profile,
+ * so node/npm won't be in PATH unless we resolve it explicitly.
+ */
+function resolveUserShellPath(): string | null {
+  if (process.platform === 'win32') return null;
+
+  try {
+    const shell = process.env.SHELL || '/bin/bash';
+    // Use login-interactive shell to source profile, then print PATH
+    const result = execSync(`${shell} -ilc 'echo __PATH__=$PATH'`, {
+      encoding: 'utf-8',
+      timeout: 5000,
+      env: { ...process.env },
+    });
+    const match = result.match(/__PATH__=(.+)/);
+    return match ? match[1].trim() : null;
+  } catch (error) {
+    console.warn('[skills] Failed to resolve user shell PATH:', error);
+    return null;
+  }
+}
+
+/**
+ * Check if a command exists in the given environment.
+ */
+function hasCommand(command: string, env: NodeJS.ProcessEnv): boolean {
+  const checker = process.platform === 'win32' ? 'where' : 'which';
+  const result = spawnSync(checker, [command], { stdio: 'ignore', env });
+  return result.status === 0;
+}
+
+/**
+ * Build an environment for spawning skill scripts.
+ * Merges the user's shell PATH with the current process environment.
+ */
+function buildSkillEnv(): Record<string, string | undefined> {
+  const env: Record<string, string | undefined> = { ...process.env };
+
+  if (app.isPackaged) {
+    // Ensure HOME is set (crucial for npm to find its config)
+    if (!env.HOME) {
+      env.HOME = app.getPath('home');
+    }
+
+    // Resolve user's shell PATH to find npm/node
+    const userPath = resolveUserShellPath();
+    if (userPath) {
+      env.PATH = userPath;
+      console.log('[skills] Resolved user shell PATH for skill scripts');
+    } else {
+      // Fallback: append common node installation paths
+      const commonPaths = [
+        '/usr/local/bin',
+        '/opt/homebrew/bin',
+        `${env.HOME}/.nvm/current/bin`,
+        `${env.HOME}/.volta/bin`,
+        `${env.HOME}/.fnm/current/bin`,
+      ];
+      env.PATH = [env.PATH, ...commonPaths].filter(Boolean).join(':');
+      console.log('[skills] Using fallback PATH for skill scripts');
+    }
+  }
+
+  // Expose Electron executable so skill scripts can run JS with ELECTRON_RUN_AS_NODE
+  // even when system Node.js is not installed.
+  env.LOBSTERAI_ELECTRON_PATH = process.execPath;
+
+  return env;
+}
 
 export type SkillRecord = {
   id: string;
@@ -52,34 +126,36 @@ const SKILL_FILE_NAME = 'SKILL.md';
 const SKILLS_CONFIG_FILE = 'skills.config.json';
 const SKILL_STATE_KEY = 'skills_state';
 const WATCH_DEBOUNCE_MS = 250;
+const CLAUDE_SKILLS_DIR_NAME = '.claude';
+const CLAUDE_SKILLS_SUBDIR = 'skills';
 
 const FRONTMATTER_RE = /^---\r?\n([\s\S]*?)\r?\n---\r?\n?/;
 
-const parseFrontmatter = (raw: string): { frontmatter: Record<string, string>; content: string } => {
+const parseFrontmatter = (raw: string): { frontmatter: Record<string, unknown>; content: string } => {
   const normalized = raw.replace(/^\uFEFF/, '');
   const match = normalized.match(FRONTMATTER_RE);
   if (!match) {
     return { frontmatter: {}, content: normalized };
   }
 
-  const frontmatter: Record<string, string> = {};
-  const lines = match[1].split(/\r?\n/);
-  for (const line of lines) {
-    const trimmed = line.trim();
-    if (!trimmed || trimmed.startsWith('#')) continue;
-    const kv = trimmed.match(/^([A-Za-z0-9_-]+):\s*(.*)$/);
-    if (!kv) continue;
-    const key = kv[1];
-    const value = (kv[2] ?? '').trim().replace(/^['"]|['"]$/g, '');
-    frontmatter[key] = value;
+  let frontmatter: Record<string, unknown> = {};
+  try {
+    const parsed = yaml.load(match[1]);
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      frontmatter = parsed as Record<string, unknown>;
+    }
+  } catch (e) {
+    console.warn('[skills] Failed to parse YAML frontmatter:', e);
   }
 
   const content = normalized.slice(match[0].length);
   return { frontmatter, content };
 };
 
-const isTruthy = (value?: string): boolean => {
+const isTruthy = (value?: unknown): boolean => {
+  if (value === true) return true;
   if (!value) return false;
+  if (typeof value !== 'string') return false;
   const normalized = value.trim().toLowerCase();
   return normalized === 'true' || normalized === 'yes' || normalized === '1';
 };
@@ -705,29 +781,47 @@ export class SkillManager {
       return;
     }
 
+    console.log('[skills] syncBundledSkillsToUserData: start');
     const userRoot = this.ensureSkillsRoot();
+    console.log('[skills] syncBundledSkillsToUserData: userRoot =', userRoot);
     const bundledRoot = this.getBundledSkillsRoot();
+    console.log('[skills] syncBundledSkillsToUserData: bundledRoot =', bundledRoot);
     if (!bundledRoot || bundledRoot === userRoot || !fs.existsSync(bundledRoot)) {
+      console.log('[skills] syncBundledSkillsToUserData: bundledRoot skipped (missing or same as userRoot)');
       return;
     }
 
     try {
       const bundledSkillDirs = listSkillDirs(bundledRoot);
+      console.log('[skills] syncBundledSkillsToUserData: found', bundledSkillDirs.length, 'bundled skills');
       bundledSkillDirs.forEach((dir) => {
         const id = path.basename(dir);
         const targetDir = path.join(userRoot, id);
         const targetExists = fs.existsSync(targetDir);
-        const shouldRepair = id === 'web-search' && targetExists && isWebSearchSkillBroken(targetDir);
+
+        // Check if skill needs repair
+        let shouldRepair = false;
+        if (targetExists) {
+          // web-search has specific broken checks
+          if (id === 'web-search' && isWebSearchSkillBroken(targetDir)) {
+            shouldRepair = true;
+          }
+          // Generic check: if bundled has node_modules but target doesn't, repair it
+          else if (!this.isSkillRuntimeHealthy(targetDir, dir)) {
+            shouldRepair = true;
+          }
+        }
+
         if (targetExists && !shouldRepair) return;
         try {
-          fs.cpSync(dir, targetDir, {
-            recursive: true,
+          console.log(`[skills] syncBundledSkillsToUserData: copying "${id}" from ${dir} to ${targetDir}`);
+          cpRecursiveSync(dir, targetDir, {
             dereference: true,
             force: shouldRepair,
-            errorOnExist: false,
           });
+          console.log(`[skills] syncBundledSkillsToUserData: copied "${id}" successfully`);
           if (shouldRepair) {
-            console.log('[skills] Repaired bundled skill "web-search" in user data');
+            console.log(`[skills] Repaired bundled skill "${id}" in user data`);
           }
         } catch (error) {
           console.warn(`[skills] Failed to sync bundled skill "${id}":`, error);
@@ -737,11 +831,40 @@ export class SkillManager {
       const bundledConfig = path.join(bundledRoot, SKILLS_CONFIG_FILE);
       const targetConfig = path.join(userRoot, SKILLS_CONFIG_FILE);
       if (fs.existsSync(bundledConfig) && !fs.existsSync(targetConfig)) {
-        fs.cpSync(bundledConfig, targetConfig, { dereference: false });
+        console.log('[skills] syncBundledSkillsToUserData: copying skills.config.json');
+        cpRecursiveSync(bundledConfig, targetConfig);
       }
+      console.log('[skills] syncBundledSkillsToUserData: done');
     } catch (error) {
       console.warn('[skills] Failed to sync bundled skills:', error);
     }
+  }
+
+  /**
+   * Check if a skill's runtime is healthy by comparing with bundled version.
+   * Returns false if bundled has dependencies but target doesn't.
+   */
+  private isSkillRuntimeHealthy(targetDir: string, bundledDir: string): boolean {
+    const bundledNodeModules = path.join(bundledDir, 'node_modules');
+    const targetNodeModules = path.join(targetDir, 'node_modules');
+    const targetPackageJson = path.join(targetDir, 'package.json');
+
+    // If target has no package.json, it's a simple skill (no deps needed)
+    if (!fs.existsSync(targetPackageJson)) {
+      return true;
+    }
+
+    // If bundled doesn't have node_modules, no deps to sync
+    if (!fs.existsSync(bundledNodeModules)) {
+      return true;
+    }
+
+    // If bundled has node_modules but target doesn't, needs repair
+    if (!fs.existsSync(targetNodeModules)) {
+      return false;
+    }
+
+    return true;
   }
 
   listSkills(): SkillRecord[] {
@@ -933,7 +1056,7 @@ export class SkillManager {
           targetDir = resolveWithin(root, `${folderName}-${suffix}`);
           suffix += 1;
         }
-        fs.cpSync(skillDir, targetDir, { recursive: true, dereference: false });
+        cpRecursiveSync(skillDir, targetDir);
       }
 
       cleanupPathSafely(cleanupPath);
@@ -1016,8 +1139,8 @@ export class SkillManager {
     try {
       const raw = fs.readFileSync(skillFile, 'utf8');
       const { frontmatter, content } = parseFrontmatter(raw);
-      const name = (frontmatter.name || path.basename(dir)).trim() || path.basename(dir);
-      const description = (frontmatter.description || extractDescription(content) || name).trim();
+      const name = (String(frontmatter.name || '') || path.basename(dir)).trim() || path.basename(dir);
+      const description = (String(frontmatter.description || '') || extractDescription(content) || name).trim();
       const isOfficial = isTruthy(frontmatter.official) || isTruthy(frontmatter.isOfficial);
       const updatedAt = fs.statSync(skillFile).mtimeMs;
       const id = path.basename(dir);
@@ -1090,12 +1213,23 @@ export class SkillManager {
 
   private getSkillRoots(primaryRoot?: string): string[] {
     const resolvedPrimary = primaryRoot ?? this.getSkillsRoot();
-    const roots = [resolvedPrimary];
+    const roots: string[] = [resolvedPrimary];
+
+    const claudeSkillsRoot = this.getClaudeSkillsRoot();
+    if (claudeSkillsRoot && fs.existsSync(claudeSkillsRoot)) {
+      roots.push(claudeSkillsRoot);
+    }
+
     const appRoot = this.getBundledSkillsRoot();
     if (appRoot !== resolvedPrimary && fs.existsSync(appRoot)) {
       roots.push(appRoot);
     }
     return roots;
+  }
+
+  private getClaudeSkillsRoot(): string | null {
+    const homeDir = app.getPath('home');
+    return path.join(homeDir, CLAUDE_SKILLS_DIR_NAME, CLAUDE_SKILLS_SUBDIR);
   }
 
   private getBundledSkillsRoot(): string {
@@ -1154,12 +1288,142 @@ export class SkillManager {
     }
   }
 
+  private repairSkillFromBundled(skillId: string, skillPath: string): boolean {
+    if (!app.isPackaged) return false;
+
+    const bundledRoot = this.getBundledSkillsRoot();
+    if (!bundledRoot || !fs.existsSync(bundledRoot)) {
+      return false;
+    }
+
+    const bundledPath = path.join(bundledRoot, skillId);
+    if (!fs.existsSync(bundledPath) || bundledPath === skillPath) {
+      return false;
+    }
+
+    // Check if bundled version has node_modules
+    const bundledNodeModules = path.join(bundledPath, 'node_modules');
+    if (!fs.existsSync(bundledNodeModules)) {
+      console.log(`[skills] Bundled ${skillId} does not have node_modules, skipping repair`);
+      return false;
+    }
+
+    try {
+      console.log(`[skills] Repairing ${skillId} from bundled resources...`);
+      fs.cpSync(bundledPath, skillPath, {
+        recursive: true,
+        dereference: true,
+        force: true,
+        errorOnExist: false,
+      });
+      console.log(`[skills] Repaired ${skillId} from bundled resources`);
+      return true;
+    } catch (error) {
+      console.warn(`[skills] Failed to repair ${skillId} from bundled resources:`, error);
+      return false;
+    }
+  }
+
+  private ensureSkillDependencies(skillDir: string): { success: boolean; error?: string } {
+    const nodeModulesPath = path.join(skillDir, 'node_modules');
+    const packageJsonPath = path.join(skillDir, 'package.json');
+    const skillId = path.basename(skillDir);
+
+    console.log(`[skills] Checking dependencies for ${skillId}...`);
+    console.log(`[skills]   node_modules exists: ${fs.existsSync(nodeModulesPath)}`);
+    console.log(`[skills]   package.json exists: ${fs.existsSync(packageJsonPath)}`);
+    console.log(`[skills]   skillDir: ${skillDir}`);
+
+    // If node_modules exists, assume dependencies are installed
+    if (fs.existsSync(nodeModulesPath)) {
+      console.log(`[skills] Dependencies already installed for ${skillId}`);
+      return { success: true };
+    }
+
+    // If no package.json, nothing to install
+    if (!fs.existsSync(packageJsonPath)) {
+      console.log(`[skills] No package.json found for ${skillId}, skipping install`);
+      return { success: true };
+    }
+
+    // Try to repair from bundled resources first (works without npm)
+    if (this.repairSkillFromBundled(skillId, skillDir)) {
+      if (fs.existsSync(nodeModulesPath)) {
+        console.log(`[skills] Dependencies restored from bundled resources for ${skillId}`);
+        return { success: true };
+      }
+    }
+
+    // Build environment with user's shell PATH (crucial for packaged apps)
+    const env = buildSkillEnv() as NodeJS.ProcessEnv;
+    console.log(`[skills]   PATH: ${env.PATH?.substring(0, 100)}...`);
+
+    // Check if npm is available (use 'npm' on both platforms, spawnSync handles the extension)
+    if (!hasCommand('npm', env)) {
+      const errorMsg = 'npm is not available and skill cannot be repaired from bundled resources. Please install Node.js from https://nodejs.org/';
+      console.error(`[skills] ${errorMsg}`);
+      return { success: false, error: errorMsg };
+    }
+
+    console.log(`[skills] npm is available`);
+
+    // Try to install dependencies
+    console.log(`[skills] Installing dependencies for ${skillId}...`);
+    console.log(`[skills]   Working directory: ${skillDir}`);
+
+    try {
+      // Use 'npm' directly - Node.js child_process handles .cmd extension on Windows
+      const result = spawnSync('npm', ['install'], {
+        cwd: skillDir,
+        encoding: 'utf-8',
+        stdio: 'pipe',
+        timeout: 120000, // 2 minute timeout
+        env,
+      });
+
+      console.log(`[skills] npm install exit code: ${result.status}`);
+      if (result.stdout) {
+        console.log(`[skills] npm install stdout: ${result.stdout.substring(0, 500)}`);
+      }
+      if (result.stderr) {
+        console.log(`[skills] npm install stderr: ${result.stderr.substring(0, 500)}`);
+      }
+
+      if (result.status !== 0) {
+        const errorMsg = result.stderr || result.stdout || 'npm install failed';
+        console.error(`[skills] Failed to install dependencies for ${skillId}:`, errorMsg);
+        return { success: false, error: `Failed to install dependencies: ${errorMsg}` };
+      }
+
+      // Verify node_modules was created
+      if (!fs.existsSync(nodeModulesPath)) {
+        const errorMsg = 'npm install appeared to succeed but node_modules was not created';
+        console.error(`[skills] ${errorMsg}`);
+        return { success: false, error: errorMsg };
+      }
+
+      console.log(`[skills] Dependencies installed successfully for ${skillId}`);
+      return { success: true };
+    } catch (error) {
+      const errorMsg = error instanceof Error ? error.message : String(error);
+      console.error(`[skills] Error installing dependencies for ${skillId}:`, errorMsg);
+      return { success: false, error: `Failed to install dependencies: ${errorMsg}` };
+    }
+  }
+
   async testEmailConnectivity(
     skillId: string,
     config: Record<string, string>
   ): Promise<{ success: boolean; result?: EmailConnectivityTestResult; error?: string }> {
     try {
       const skillDir = this.resolveSkillDir(skillId);
+
+      // Ensure dependencies are installed before running scripts
+      const depsResult = this.ensureSkillDependencies(skillDir);
+      if (!depsResult.success) {
+        return { success: false, error: depsResult.error };
+      }
+
       const imapScript = path.join(skillDir, 'scripts', 'imap.js');
       const smtpScript = path.join(skillDir, 'scripts', 'smtp.js');
       if (!fs.existsSync(imapScript) || !fs.existsSync(smtpScript)) {
@@ -1239,9 +1503,12 @@ export class SkillManager {
   ): Promise<SkillScriptRunResult> {
     let lastResult: SkillScriptRunResult | null = null;
 
+    // Build base environment with user's shell PATH
+    const baseEnv = buildSkillEnv();
+
     for (const runtime of this.getScriptRuntimeCandidates()) {
       const env: NodeJS.ProcessEnv = {
-        ...process.env,
+        ...baseEnv,
         ...runtime.extraEnv,
         ...envOverrides,
       };
@@ -1349,3 +1616,9 @@ export class SkillManager {
     return null;
   }
 }
+
+export const __skillManagerTestUtils = {
+  parseFrontmatter,
+  isTruthy,
+  extractDescription,
+};

@@ -4,10 +4,19 @@ import type { SqliteStore } from '../sqliteStore';
 import type { CoworkApiConfig } from './coworkConfigStore';
 import {
   configureCoworkOpenAICompatProxy,
+  type OpenAICompatProxyTarget,
   getCoworkOpenAICompatProxyBaseURL,
   getCoworkOpenAICompatProxyStatus,
 } from './coworkOpenAICompatProxy';
 import { normalizeProviderApiFormat, type AnthropicApiFormat } from './coworkFormatTransform';
+
+const ZHIPU_CODING_PLAN_BASE_URL = 'https://open.bigmodel.cn/api/coding/paas/v4';
+// Qwen Coding Plan 专属端点 (OpenAI 兼容和 Anthropic 兼容)
+const QWEN_CODING_PLAN_OPENAI_BASE_URL = 'https://coding.dashscope.aliyuncs.com/v1';
+const QWEN_CODING_PLAN_ANTHROPIC_BASE_URL = 'https://coding.dashscope.aliyuncs.com/apps/anthropic';
+// Volcengine Coding Plan 专属端点 (OpenAI 兼容和 Anthropic 兼容)
+const VOLCENGINE_CODING_PLAN_OPENAI_BASE_URL = 'https://ark.cn-beijing.volces.com/api/coding/v3';
+const VOLCENGINE_CODING_PLAN_ANTHROPIC_BASE_URL = 'https://ark.cn-beijing.volces.com/api/coding';
 
 type ProviderModel = {
   id: string;
@@ -19,6 +28,7 @@ type ProviderConfig = {
   baseUrl: string;
   apiFormat?: 'anthropic' | 'openai' | 'antigravity' | 'native';
   authMode?: 'api-key' | 'oauth';
+  codingPlanEnabled?: boolean;
   models?: ProviderModel[];
 };
 
@@ -80,6 +90,7 @@ type MatchedProvider = {
   providerConfig: ProviderConfig;
   modelId: string;
   apiFormat: AnthropicApiFormat;
+  baseURL: string;
 };
 
 function getEffectiveProviderApiFormat(providerName: string, apiFormat: unknown): AnthropicApiFormat {
@@ -93,6 +104,10 @@ function getEffectiveProviderApiFormat(providerName: string, apiFormat: unknown)
     return 'anthropic';
   }
   return normalizeProviderApiFormat(apiFormat);
+}
+
+function providerRequiresApiKey(providerName: string): boolean {
+  return providerName !== 'ollama';
 }
 
 function resolveMatchedProvider(appConfig: AppConfig): { matched: MatchedProvider | null; error?: string } {
@@ -125,14 +140,47 @@ function resolveMatchedProvider(appConfig: AppConfig): { matched: MatchedProvide
   }
 
   const [providerName, providerConfig] = providerEntry;
-  const apiFormat = getEffectiveProviderApiFormat(providerName, providerConfig.apiFormat);
-  const baseURL = providerConfig.baseUrl?.trim();
+  let apiFormat = getEffectiveProviderApiFormat(providerName, providerConfig.apiFormat);
+  let baseURL = providerConfig.baseUrl?.trim();
+
+  // Handle Zhipu GLM Coding Plan endpoint switch
+  if (providerName === 'zhipu' && providerConfig.codingPlanEnabled) {
+    baseURL = ZHIPU_CODING_PLAN_BASE_URL;
+    apiFormat = 'openai';
+  }
+
+  // Handle Qwen Coding Plan endpoint switch
+  // Coding Plan supports both OpenAI and Anthropic compatible formats
+  if (providerName === 'qwen' && providerConfig.codingPlanEnabled) {
+    if (apiFormat === 'anthropic') {
+      baseURL = QWEN_CODING_PLAN_ANTHROPIC_BASE_URL;
+    } else {
+      baseURL = QWEN_CODING_PLAN_OPENAI_BASE_URL;
+      apiFormat = 'openai';
+    }
+  }
+
+  // Handle Volcengine Coding Plan endpoint switch
+  // Coding Plan supports both OpenAI and Anthropic compatible formats
+  if (providerName === 'volcengine' && providerConfig.codingPlanEnabled) {
+    if (apiFormat === 'anthropic') {
+      baseURL = VOLCENGINE_CODING_PLAN_ANTHROPIC_BASE_URL;
+    } else {
+      baseURL = VOLCENGINE_CODING_PLAN_OPENAI_BASE_URL;
+      apiFormat = 'openai';
+    }
+  }
 
   if (!baseURL) {
     return { matched: null, error: `Provider ${providerName} is missing base URL.` };
   }
 
-  if (apiFormat === 'anthropic' && providerConfig.authMode !== 'oauth' && !providerConfig.apiKey?.trim()) {
+  if (
+    apiFormat === 'anthropic'
+    && providerRequiresApiKey(providerName)
+    && providerConfig.authMode !== 'oauth'
+    && !providerConfig.apiKey?.trim()
+  ) {
     return { matched: null, error: `Provider ${providerName} requires API key for Anthropic-compatible mode.` };
   }
 
@@ -142,11 +190,12 @@ function resolveMatchedProvider(appConfig: AppConfig): { matched: MatchedProvide
       providerConfig,
       modelId,
       apiFormat,
+      baseURL,
     },
   };
 }
 
-export function resolveCurrentApiConfig(): ApiConfigResolution {
+export function resolveCurrentApiConfig(target: OpenAICompatProxyTarget = 'local'): ApiConfigResolution {
   const sqliteStore = getStore();
   if (!sqliteStore) {
     return {
@@ -171,13 +220,18 @@ export function resolveCurrentApiConfig(): ApiConfigResolution {
     };
   }
 
-  const resolvedBaseURL = matched.providerConfig.baseUrl.trim();
+  const resolvedBaseURL = matched.baseURL;
   const resolvedApiKey = matched.providerConfig.apiKey?.trim() || '';
+  const effectiveApiKey = matched.providerName === 'ollama'
+    && matched.apiFormat === 'anthropic'
+    && !resolvedApiKey
+    ? 'sk-ollama-local'
+    : resolvedApiKey;
 
   if (matched.apiFormat === 'anthropic') {
     return {
       config: {
-        apiKey: resolvedApiKey,
+        apiKey: effectiveApiKey,
         baseURL: resolvedBaseURL,
         model: matched.modelId,
         apiType: 'anthropic',
@@ -244,7 +298,7 @@ export function resolveCurrentApiConfig(): ApiConfigResolution {
     upstreamKind: 'openai',
   });
 
-  const proxyBaseURL = getCoworkOpenAICompatProxyBaseURL();
+  const proxyBaseURL = getCoworkOpenAICompatProxyBaseURL(target);
   if (!proxyBaseURL) {
     return {
       config: null,
@@ -262,14 +316,15 @@ export function resolveCurrentApiConfig(): ApiConfigResolution {
   };
 }
 
-export function getCurrentApiConfig(): CoworkApiConfig | null {
-  return resolveCurrentApiConfig().config;
+export function getCurrentApiConfig(target: OpenAICompatProxyTarget = 'local'): CoworkApiConfig | null {
+  return resolveCurrentApiConfig(target).config;
 }
 
 export function buildEnvForConfig(config: CoworkApiConfig): Record<string, string> {
   const baseEnv = { ...process.env } as Record<string, string>;
 
   baseEnv.ANTHROPIC_AUTH_TOKEN = config.apiKey;
+  baseEnv.ANTHROPIC_API_KEY = config.apiKey;
   baseEnv.ANTHROPIC_BASE_URL = config.baseURL;
   baseEnv.ANTHROPIC_MODEL = config.model;
 
